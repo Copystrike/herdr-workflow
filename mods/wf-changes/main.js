@@ -13,7 +13,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import {
   spaces, panes, focused, exec, watchFolder, theme, shared, setShared,
-  openOverlay, run, notify, checking,
+  openOverlay, run, notify, checking, nextCommand,
 } from "herdr";
 import {
   filterFuzzy, parseNumstatZ, parsePorcelainSplit, parseNameStatusZ,
@@ -157,6 +157,7 @@ export default class WorkflowChanges extends View {
 
     this.lastActionTs = 0;
     this.openingViewer = false;
+    this.pendingContext = null;
 
     // ALL InputStates created ONLY in init() (never inside render!)
     this.searchQuery = "";
@@ -185,8 +186,16 @@ export default class WorkflowChanges extends View {
     this.commitInput.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
 
     if (checking()) return;
-    this.refresh(cx);
+    this.refresh(cx, { quiet: true });
     cx.timer.every(12000, cx => this.refresh(cx, { quiet: true }));
+    cx.spawn(async cx => {
+      for (;;) {
+        const raw = await nextCommand();
+        const [name, arg] = String(raw).split(/:(.*)/s);
+        if (name === "tab" && ["commit", "compare", "history"].includes(arg)) this.setTab(arg, cx);
+        else if (name === "refresh") this.refresh(cx);
+      }
+    });
   }
 
   // ------------------------------------------------------------------ git & viewed helpers
@@ -375,6 +384,8 @@ export default class WorkflowChanges extends View {
       this.compareError = null;
       this.diffHits = [];
       this.commits = [];
+      this.graphRows = [];
+      this.graphLanes = 1;
       this.historyLimit = HISTORY_PAGE;
       this.selectedCommit = null;
       this.commitFiles = {};
@@ -442,8 +453,11 @@ export default class WorkflowChanges extends View {
         this.watch(root, cx);
 
         if (changed && this.slug && this.headBranch) this.loadPr(root, this.slug, this.headBranch, context, cx);
-        if (this.tab === "compare") await this.loadCompareAsync(context, cx);
-        else if (this.tab === "history") await this.loadHistoryAsync(context);
+        // Load Compare refs/files and active tab data so switching tabs is instant & never empty.
+        await Promise.all([
+          this.loadCompareAsync(context, cx),
+          this.tab === "history" || !this.commits.length ? this.loadHistoryAsync(context) : Promise.resolve(),
+        ]);
       } catch (e) {
         if (locKey() === context) this.error = String(e?.message ?? e);
       } finally {
@@ -494,8 +508,9 @@ export default class WorkflowChanges extends View {
   }
 
   loadCompare(cx) {
+    if (!this.root) { this.refresh(cx); return; }
+    if (this.compareLoading) return;
     const context = this.context;
-    if (!this.root || this.compareLoading) return;
     cx.spawn(async cx => {
       await this.loadCompareAsync(context, cx);
       cx.notify();
@@ -589,8 +604,8 @@ export default class WorkflowChanges extends View {
   }
 
   loadHistory(cx) {
+    if (!this.root) { this.refresh(cx); return; }
     const context = this.context;
-    if (!this.root) return;
     cx.spawn(async cx => {
       await this.loadHistoryAsync(context);
       cx.notify();
@@ -1183,8 +1198,9 @@ export default class WorkflowChanges extends View {
           .child("All branches")))
       // Continuous zero-gap commit graph list
       .child(v_flex().id("hist-list").flex_1().min_h(0).overflow_y_scrollbar().px(4).py(2).gap(0)
-        .when(this.historyLoading && !this.commits.length, el => el.child(div().p(8).text_size(11.5).text_color(t.dim).child("Loading history...")))
-        .when(!this.historyLoading && !this.commits.length, el => el.child(div().p(8).text_size(11.5).text_color(t.dim).child(this.searchQuery.trim() ? "No matching commits" : "No commits yet")))
+        .when(Boolean(this.error), el => el.child(div().p(8).text_size(11.5).text_color(t.ansi1).child(this.error)))
+        .when(!this.error && this.historyLoading && !this.commits.length, el => el.child(div().p(8).text_size(11.5).text_color(t.dim).child("Loading history...")))
+        .when(!this.error && !this.historyLoading && !this.commits.length, el => el.child(div().p(8).text_size(11.5).text_color(t.dim).child(this.searchQuery.trim() ? "No matching commits" : "No commits yet")))
         .children(this.commits.map((c, idx) => {
           const grow = this.graphRows[idx] ?? { lane: 0, color: 0, links: [], afterLanes: [] };
           const open = this.selectedCommit === c.sha;
@@ -1224,7 +1240,14 @@ export default class WorkflowChanges extends View {
   }
 
   render(cx) {
-    if (locKey() !== this.context) this.refresh(cx, { quiet: true });
+    const curLoc = locKey();
+    if (curLoc !== this.context && curLoc !== this.pendingContext) {
+      this.pendingContext = curLoc;
+      cx.spawn(async cx => {
+        this.pendingContext = null;
+        this.refresh(cx, { quiet: true });
+      });
+    }
     const pendingAct = shared("wf.gitAction");
     if (pendingAct?.ts && pendingAct.ts > this.lastActionTs && (!pendingAct.root || !this.root || pendingAct.root === this.root)) {
       cx.spawn(async cx => { this.consumeGitAction(cx); });

@@ -1628,20 +1628,27 @@ export default class WorkflowSidebar extends View {
       totalRunning += c.running;
     }
 
-    // Pick up rename requests from wf-menu (branch or session)
+    // Pick up rename requests from wf-menu (branch or session) — defer InputState mutations out of draw()
     const renameReq = shared("wf.rename");
     if (renameReq?.path && renameReq.ts !== this.renaming?.ts) {
       this.renaming = renameReq;
       const names = shared("wf.branchNames");
       const currentName = (names && names[renameReq.path]) || renameReq.branch || "";
-      this.renameInput.set_value(currentName);
-      this.renameInput.focus();
+      cx.spawn(async cx => {
+        this.renameInput.set_value(currentName);
+        this.renameInput.focus();
+        cx.notify();
+      });
     }
     const sessRenameReq = shared("wf.renameSession");
     if (sessRenameReq?.key && sessRenameReq.ts !== this.renamingSession?.ts) {
       this.renamingSession = sessRenameReq;
-      this.sessionRenameInput.set_value(sessRenameReq.currentName ?? "");
-      this.sessionRenameInput.focus();
+      const currentName = sessRenameReq.currentName ?? "";
+      cx.spawn(async cx => {
+        this.sessionRenameInput.set_value(currentName);
+        this.sessionRenameInput.focus();
+        cx.notify();
+      });
     }
     const bump = shared("wf.sessionsBump");
     if (bump?.ts && bump.ts > this.lastSessionsBump) {

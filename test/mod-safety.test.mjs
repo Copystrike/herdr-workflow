@@ -15,6 +15,7 @@ const MOD_NAMES = readdirSync(MODS_DIR, { withFileTypes: true }).filter(d => d.i
 
 const HOST_STATE_CTOR = /\b(?:InputState|EditorState|TextareaState|SliderState)\.new\s*\(/;
 const SYNC_NOTIFY = /\bcx\.notify\s*\(/;
+const ENTITY_MUTATION = /\.\s*(?:set_value|set_text|focus)\s*\(/;
 
 // Extracts top-level method blocks inside a class by brace-depth tracking.
 function extractMethods(src) {
@@ -116,15 +117,33 @@ test("mod-safety: no retained GPUI state constructors (InputState/EditorState/et
   }
 });
 
-test("mod-safety: no unguarded synchronous cx.notify() directly inside render() or draw()", () => {
+test("mod-safety: no unguarded synchronous cx.notify() or entity mutations (.set_value/.focus) reachable from render() or draw()", () => {
   for (const mod of MOD_NAMES) {
     const file = join(MODS_DIR, mod, "main.js");
     const src = readFileSync(file, "utf8");
     const methods = extractMethods(src);
-    for (const m of methods) {
-      if (m.name !== "render" && m.name !== "draw") continue;
-      const syncCode = stripDeferredCallbacks(m.body);
-      assert.equal(SYNC_NOTIFY.test(syncCode), false, `${mod}/main.js calls cx.notify() synchronously inside ${m.name}()`);
+    const byName = new Map(methods.map(m => [m.name, m.body]));
+    const renderEntry = methods.filter(m => m.name === "render" || m.name === "draw" || m.name.startsWith("render"));
+    const visited = new Set();
+    const queue = renderEntry.map(m => m.name);
+    while (queue.length) {
+      const name = queue.shift();
+      if (visited.has(name)) continue;
+      visited.add(name);
+      const body = byName.get(name) || "";
+      const syncCode = stripDeferredCallbacks(body);
+      if (name === "render" || name === "draw") {
+        assert.equal(SYNC_NOTIFY.test(syncCode), false, `${mod}/main.js calls cx.notify() synchronously inside ${name}()`);
+      }
+      assert.equal(
+        ENTITY_MUTATION.test(syncCode),
+        false,
+        `${mod}/main.js calls ${syncCode.match(ENTITY_MUTATION)?.[0]} synchronously from render-reachable ${name}() (defer via cx.spawn)`,
+      );
+      for (const call of syncCode.matchAll(/this\.([a-zA-Z_$][\w$]*)\s*\(/g)) {
+        const target = call[1];
+        if (byName.has(target) && !visited.has(target)) queue.push(target);
+      }
     }
   }
 });
