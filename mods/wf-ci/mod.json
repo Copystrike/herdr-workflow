@@ -1,0 +1,8 @@
+{
+  "name": "wf-ci",
+  "entry": "main.js",
+  "place": "none",
+  "focusable": true,
+  "title": "CI Pipelines",
+  "version": 1
+}

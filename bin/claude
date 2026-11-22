@@ -1,0 +1,53 @@
+#!/bin/sh
+# Starts Claude Code without the 9 parent-session markers a parent Claude terminal can leak
+# through herdr-core (e.g. CLAUDE_CODE_CHILD_SESSION turns transcript saving off).
+# Preserves user feature flags such as CLAUDE_CODE_EXPERIMENTAL_CODE_MODE,
+# CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS, and CLAUDE_CONFIG_DIR.
+# Named `claude` so herdr identifies the terminal as Claude Code.
+#
+# Supports leading `--wf-code-mode` (consumed here) to enable experimental Code Mode when
+# resuming a Code Mode session or launching one explicitly.
+#
+# When started inside a worktree under a multi-repo folder (<workspace>/repos/<repo>/...
+# where <workspace>/.claude exists), automatically passes `--add-dir <workspace>` so Claude
+# inherits the workspace's `.claude/skills`. Standalone repos outside a workspace get no extra flags.
+unset CLAUDECODE \
+  CLAUDE_CODE_CHILD_SESSION \
+  CLAUDE_CODE_ENTRYPOINT \
+  CLAUDE_CODE_EXECPATH \
+  CLAUDE_CODE_MESSAGING_SOCKET \
+  CLAUDE_CODE_MESSAGING_TOKEN \
+  CLAUDE_CODE_SESSION_ATTENDED \
+  CLAUDE_CODE_SESSION_ID \
+  CLAUDE_CODE_SUBAGENT_MODEL
+
+if [ "${1:-}" = "--wf-code-mode" ]; then
+  export CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1
+  shift
+fi
+
+has_add_dir=0
+for arg in "$@"; do
+  if [ "$arg" = "--add-dir" ]; then
+    has_add_dir=1
+    break
+  fi
+done
+
+if [ "$has_add_dir" -eq 0 ]; then
+  dir="$PWD"
+  ws=""
+  while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+    parent=$(dirname "$dir")
+    if [ "$(basename "$dir")" = "repos" ] && [ -d "$parent/.claude" ]; then
+      ws="$parent"
+      break
+    fi
+    dir="$parent"
+  done
+  if [ -n "$ws" ]; then
+    exec claude --add-dir "$ws" "$@"
+  fi
+fi
+
+exec claude "$@"

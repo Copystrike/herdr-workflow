@@ -1,0 +1,9 @@
+build/
+node_modules/
+test/e2e-shots/
+*.png
+*.jpg
+*.jpeg
+mods/*/gpui-kit.d.ts
+mods/*/jsconfig.json
+.DS_Store
