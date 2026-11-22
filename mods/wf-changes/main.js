@@ -156,6 +156,7 @@ export default class WorkflowChanges extends View {
     this.commitFiles = {}; // sha -> { loading, files, error }
 
     this.lastActionTs = 0;
+    this.pendingActionTs = 0;
     this.openingViewer = false;
     this.pendingContext = null;
 
@@ -194,6 +195,12 @@ export default class WorkflowChanges extends View {
         const [name, arg] = String(raw).split(/:(.*)/s);
         if (name === "tab" && ["commit", "compare", "history"].includes(arg)) this.setTab(arg, cx);
         else if (name === "refresh") this.refresh(cx);
+        else if (name === "stage" && arg) this.stagePaths([arg], cx);
+        else if (name === "unstage" && arg) this.unstagePaths([arg], cx);
+        else if (name === "discard" && arg) {
+          const hit = this.unstaged.find(f => f.path === arg);
+          if (hit) this.discardFiles([hit], cx);
+        }
       }
     });
   }
@@ -668,20 +675,25 @@ export default class WorkflowChanges extends View {
     const root = this.root, on = this.on, context = this.context;
     this.busy = true;
     this.note = null;
-    cx.notify();
-    cx.spawn(async cx => {
-      try { await fn(root, on); }
-      catch (e) {
-        if (locKey() === context) {
-          this.note = `${label} failed: ${e?.message ?? e}`;
-          notify({ title: `${label} failed`, body: String(e?.message ?? e), level: "error" });
-        }
-      } finally {
-        this.busy = false;
-        this.refresh(cx);
+    try {
+      cx.spawn(async cx => {
         cx.notify();
-      }
-    });
+        try { await fn(root, on); }
+        catch (e) {
+          if (locKey() === context) {
+            this.note = `${label} failed: ${e?.message ?? e}`;
+            notify({ title: `${label} failed`, body: String(e?.message ?? e), level: "error" });
+          }
+        } finally {
+          this.busy = false;
+          this.refresh(cx, { quiet: true });
+          cx.notify();
+        }
+      });
+    } catch (e) {
+      this.busy = false;
+      this.note = `${label} failed: ${e?.message ?? e}`;
+    }
   }
 
   runSync(kind, cx) {
@@ -1243,14 +1255,18 @@ export default class WorkflowChanges extends View {
     const curLoc = locKey();
     if (curLoc !== this.context && curLoc !== this.pendingContext) {
       this.pendingContext = curLoc;
-      cx.spawn(async cx => {
+      cx.timer.after(1, cx => {
         this.pendingContext = null;
         this.refresh(cx, { quiet: true });
       });
     }
     const pendingAct = shared("wf.gitAction");
-    if (pendingAct?.ts && pendingAct.ts > this.lastActionTs && (!pendingAct.root || !this.root || pendingAct.root === this.root)) {
-      cx.spawn(async cx => { this.consumeGitAction(cx); });
+    if (pendingAct?.ts && pendingAct.ts > this.lastActionTs && pendingAct.ts !== this.pendingActionTs && (!pendingAct.root || !this.root || pendingAct.root === this.root)) {
+      this.pendingActionTs = pendingAct.ts;
+      cx.timer.after(1, cx => {
+        this.pendingActionTs = 0;
+        this.consumeGitAction(cx);
+      });
     }
     const t = theme();
     const loc = location();

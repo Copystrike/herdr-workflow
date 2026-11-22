@@ -1634,7 +1634,7 @@ export default class WorkflowSidebar extends View {
       this.renaming = renameReq;
       const names = shared("wf.branchNames");
       const currentName = (names && names[renameReq.path]) || renameReq.branch || "";
-      cx.spawn(async cx => {
+      cx.timer.after(1, cx => {
         this.renameInput.set_value(currentName);
         this.renameInput.focus();
         cx.notify();
@@ -1644,7 +1644,7 @@ export default class WorkflowSidebar extends View {
     if (sessRenameReq?.key && sessRenameReq.ts !== this.renamingSession?.ts) {
       this.renamingSession = sessRenameReq;
       const currentName = sessRenameReq.currentName ?? "";
-      cx.spawn(async cx => {
+      cx.timer.after(1, cx => {
         this.sessionRenameInput.set_value(currentName);
         this.sessionRenameInput.focus();
         cx.notify();
