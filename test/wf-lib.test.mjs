@@ -746,3 +746,28 @@ test("terminal settings: PowerShell right-click truth table, multiline paste det
   assert.equal(wf.mergeTermSettings({ rightClick: "invalid", newlineKey: "shift" }).rightClick, "quick-edit");
   assert.equal(wf.mergeTermSettings({ rightClick: "menu", newlineKey: "shift" }).newlineKey, "shift");
 });
+
+test("forge reactive CI: HTTP ETag 304 conditional cache and gh event listen outcome parser", async () => {
+  const p200 = wf.parseHttpResponse("HTTP/2 200\r\netag: \"abc123\"\r\ncontent-type: application/json\r\n\r\n{\"ok\":true}");
+  assert.deepEqual(p200, { status: 200, etag: "\"abc123\"", body: "{\"ok\":true}" });
+
+  let calls = 0;
+  const mockExec = async (_cmd, args) => {
+    calls++;
+    if (args.includes("If-None-Match: \"v1\"")) {
+      return { code: 0, stdout: "HTTP/2 304\r\netag: \"v1\"\r\n\r\n", stderr: "" };
+    }
+    return { code: 0, stdout: "HTTP/2 200\r\netag: \"v1\"\r\n\r\n{\"workflow_runs\":[{\"id\":9}]}", stderr: "" };
+  };
+  const first = await wf.ghApiConditional(mockExec, "/tmp", "repos/acme/shop/actions/runs?test=1");
+  const second = await wf.ghApiConditional(mockExec, "/tmp", "repos/acme/shop/actions/runs?test=1");
+  assert.equal(calls, 2);
+  assert.deepEqual(first, { workflow_runs: [{ id: 9 }] });
+  assert.deepEqual(second, { workflow_runs: [{ id: 9 }] });
+
+  assert.equal(wf.parsePrEventOutcome({ code: 8, stdout: "", stderr: "" }).status, "timeout");
+  assert.equal(wf.parsePrEventOutcome({ code: 1, stdout: "", stderr: "HTTP 403: Event subscriptions are not enabled for this account" }).status, "unsupported");
+  const ev = wf.parsePrEventOutcome({ code: 0, stdout: "{\"type\":\"com.github.pull_request.check_suite.status.changed.v1\",\"data\":{\"conclusion\":\"success\"}}\n", stderr: "" });
+  assert.equal(ev.status, "event");
+  assert.equal(ev.event.data.conclusion, "success");
+});

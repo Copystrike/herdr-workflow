@@ -19,6 +19,7 @@ import {
   filterFuzzy, parseNumstatZ, parsePorcelainSplit, parseNameStatusZ,
   buildFileRows, parseCommitLog, formatCommitAge, layoutGraph, graphWidth,
   searchUnifiedDiff, githubUrlFor, repoSlugFromUrl, prCiSummary, spaceForWorktree,
+  listenPrEvent,
 } from "./lib/wf/index.js";
 
 const LANE_COLORS = [
@@ -157,6 +158,11 @@ export default class WorkflowChanges extends View {
 
     this.lastActionTs = 0;
     this.pendingActionTs = 0;
+    this.lastCiBumpTs = 0;
+    this.lastPrPollAt = 0;
+    this.prLoading = false;
+    this.eventStreamUrl = null;
+    this.eventStreamUnsupportedUntil = 0;
     this.openingViewer = false;
     this.pendingContext = null;
 
@@ -189,6 +195,13 @@ export default class WorkflowChanges extends View {
     if (checking()) return;
     this.refresh(cx, { quiet: true });
     cx.timer.every(12000, cx => this.refresh(cx, { quiet: true }));
+    // Adaptive live PR/CI watcher for the top right-sidebar PR strip: 5s while CI runs, 15s idle.
+    cx.timer.every(5000, cx => {
+      if (!this.root || !this.slug || !this.headBranch) return;
+      const active = this.prCi?.ci === "running";
+      if (!active && Date.now() - this.lastPrPollAt < 15000) return;
+      this.loadPr(this.root, this.slug, this.headBranch, this.context, cx);
+    });
     cx.spawn(async cx => {
       for (;;) {
         const raw = await nextCommand();
@@ -459,7 +472,9 @@ export default class WorkflowChanges extends View {
         this.unstaged = split.unstaged;
         this.watch(root, cx);
 
-        if (changed && this.slug && this.headBranch) this.loadPr(root, this.slug, this.headBranch, context, cx);
+        if (this.slug && this.headBranch && (changed || !quiet || Date.now() - this.lastPrPollAt > 15000)) {
+          this.loadPr(root, this.slug, this.headBranch, context, cx);
+        }
         // Load Compare refs/files and active tab data so switching tabs is instant & never empty.
         await Promise.all([
           this.loadCompareAsync(context, cx),
@@ -475,18 +490,52 @@ export default class WorkflowChanges extends View {
   }
 
   loadPr(root, slug, branch, context, cx) {
+    if (this.prLoading) return;
+    this.prLoading = true;
+    this.lastPrPollAt = Date.now();
     cx.spawn(async cx => {
       try {
         const r = await exec("gh", [
           "pr", "list", "-R", slug, "--head", branch, "--state", "all", "--limit", "1",
-          "--json", "number,title,state,isDraft,url,reviewDecision,mergeable,statusCheckRollup,reviews",
+          "--json", "number,title,state,isDraft,url,reviewDecision,mergeable,statusCheckRollup,latestReviews",
         ], { cwd: root });
         if (locKey() !== context || r.code !== 0) return;
         const arr = JSON.parse(r.stdout || "[]");
         this.pr = Array.isArray(arr) && arr.length ? arr[0] : null;
         this.prCi = this.pr ? prCiSummary(this.pr) : null;
+        if (this.pr?.state === "OPEN" && this.pr.url) this.ensureEventStream(root, slug, branch, this.pr.url, context, cx);
         cx.notify();
       } catch { /* gh optional */ }
+      finally { this.prLoading = false; }
+    });
+  }
+
+  // Uses GitHub Event Streams (`gh event listen`) for sub-second push updates on open PRs when
+  // enabled on the account; backs off cleanly for 30 min if the preview is not yet enabled (403).
+  ensureEventStream(root, slug, branch, prUrl, context, cx) {
+    if (!prUrl || this.eventStreamUrl === prUrl) return;
+    if (Date.now() < this.eventStreamUnsupportedUntil) return;
+    this.eventStreamUrl = prUrl;
+    cx.spawn(async cx => {
+      try {
+        while (this.eventStreamUrl === prUrl && locKey() === context) {
+          const out = await listenPrEvent(exec, root, prUrl, { timeoutSec: 22 });
+          if (this.eventStreamUrl !== prUrl || locKey() !== context) break;
+          if (out.status === "unsupported") {
+            this.eventStreamUnsupportedUntil = Date.now() + 30 * 60 * 1000;
+            break;
+          }
+          if (out.status === "event") {
+            this.lastPrPollAt = 0;
+            this.loadPr(root, slug, branch, context, cx);
+            setShared("wf.ciBump", { slug, branch, reason: out.event?.type || "event", ts: Date.now() });
+          } else if (out.status === "error") {
+            break;
+          }
+        }
+      } finally {
+        if (this.eventStreamUrl === prUrl) this.eventStreamUrl = null;
+      }
     });
   }
 
@@ -710,6 +759,9 @@ export default class WorkflowChanges extends View {
         const r = await exec("git", args, { cwd: root, on });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout || `git ${kind} failed`).trim());
         notify({ title: `git ${kind} complete`, body: this.headBranch || "", level: "success", timeout: 1800 });
+        if (kind === "push" && this.slug) {
+          setShared("wf.ciBump", { slug: this.slug, branch: this.headBranch, reason: "push", ts: Date.now() });
+        }
       } catch (e) {
         this.note = `git ${kind}: ${e?.message ?? e}`;
         notify({ title: `git ${kind} failed`, body: String(e?.message ?? e), level: "error" });
@@ -974,21 +1026,34 @@ export default class WorkflowChanges extends View {
     const ci = this.prCi;
     const stateLabel = pr.state === "MERGED" ? "Merged" : pr.state === "CLOSED" ? "Closed" : pr.isDraft ? "Draft" : "Open";
     const stateCol = pr.state === "MERGED" ? t.ansi5 : pr.state === "CLOSED" ? t.ansi1 : pr.isDraft ? t.dim : t.ansi2;
-    const ciLabel = ci?.ci === "passing" ? "CI" : ci?.ci === "failing" ? "CI red" : ci?.ci === "running" ? `CI ${ci.passed}/${ci.total}` : null;
+    const ciLabel = ci?.ci === "passing" ? `CI ${ci.passed}/${ci.total}`
+      : ci?.ci === "failing" ? `CI ${ci.failed} failed`
+      : ci?.ci === "running" ? `CI ${ci.passed}/${ci.total}`
+      : null;
     const ciCol = ci?.ci === "passing" ? t.ansi2 : ci?.ci === "failing" ? t.ansi1 : t.blocked;
     const revLabel = ci?.approved ? "Approved" : ci?.changesRequested ? "Changes requested" : null;
     const revCol = ci?.approved ? t.ansi2 : t.ansi1;
+    const checks = (ci?.checks ?? []).slice(0, 12);
+    const barCol = s => s === "failed" ? "#ef4444" : s === "passed" ? "#22c55e" : s === "running" ? "#16a34a" : s === "queued" ? "#15803d" : t.dim;
 
     return v_flex().id("git-pr-card").flex_none().px(10).py(6).gap(3).bg(t.raised + "55").border_b(1).border_color(t.border).cursor_pointer()
       .hover(s => s.bg(t.hover))
-      .tooltip(`Open PR #${pr.number} on GitHub`)
+      .tooltip(ci?.tooltip ? `${ci.tooltip}\nClick to open PR #${pr.number} on GitHub` : `Open PR #${pr.number} on GitHub`)
       .on_click((_e, cx) => { if (pr.url) cx.open_url(pr.url); })
       .child(h_flex().gap(7).items_center()
         .child(h_flex().gap(3).items_center()
           .child(svg("mods/workspace-chrome/git-branch.svg").size(11).text_color(stateCol))
           .child(div().text_size(10.8).font_medium().text_color(stateCol).child(stateLabel)))
-        .when(Boolean(ciLabel), el => el.child(div().text_size(10.5).text_color(ciCol).child(ciLabel)))
-        .when(Boolean(revLabel), el => el.child(div().text_size(10.5).text_color(revCol).child(revLabel))))
+        .when(Boolean(ciLabel), el => el.child(h_flex().gap(4).items_center()
+          .child(div().size(6).rounded_full().bg(ciCol)
+            .when(ci?.ci === "running", d => d.loop("opacity", { from: 0.35, to: 1, period: 1000 })))
+          .child(div().text_size(10.5).text_color(ciCol).child(ciLabel))))
+        .when(Boolean(revLabel), el => el.child(div().text_size(10.5).text_color(revCol).child(revLabel)))
+        .child(div().flex_1())
+        .when(checks.length > 0, el => el.child(h_flex().h(12).gap(2).items_end()
+          .children(checks.map((ck, idx) =>
+            div().id(`prck-${idx}`).w(3).h(Math.max(3, Math.round((ck.ratio ?? 0.5) * 12))).rounded(1).bg(barCol(ck.state))
+              .when(ck.state === "running" || ck.state === "queued", d => d.loop("opacity", { from: 0.4, to: 1, period: 1000 })))))))
       .child(div().truncate().text_size(11.2).text_color(t.muted).child(`#${pr.number} ${pr.title || ""}`));
   }
 
@@ -1258,6 +1323,16 @@ export default class WorkflowChanges extends View {
       cx.timer.after(1, cx => {
         this.pendingContext = null;
         this.refresh(cx, { quiet: true });
+      });
+    }
+    const ciBump = shared("wf.ciBump");
+    if (ciBump?.ts && ciBump.ts > this.lastCiBumpTs && (!ciBump.slug || !this.slug || ciBump.slug === this.slug)) {
+      this.lastCiBumpTs = ciBump.ts;
+      cx.timer.after(1, cx => {
+        if (this.root && this.slug && this.headBranch) {
+          this.lastPrPollAt = 0;
+          this.loadPr(this.root, this.slug, this.headBranch, this.context, cx);
+        }
       });
     }
     const pendingAct = shared("wf.gitAction");

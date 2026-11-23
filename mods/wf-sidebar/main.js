@@ -18,7 +18,8 @@ import { exec, fs, wf, setting, loadLocalConfig, track, flushTelemetry } from ".
 import { Launcher } from "./launcher.js";
 
 const SCAN_MS = 90000;
-const PR_MS = 45000;
+const ACTIVE_PR_MS = 6000; // 6s adaptive ETag poll while any CI workflow or PR check is running
+const PR_MS = 20000;       // 20s idle poll (304 Not Modified = 0 rate-limit cost)
 const MIN_GAP_MS = 3000;
 const MAX_WATCHES = 20;
 const PAST_SHOWN = 4;
@@ -112,6 +113,8 @@ export default class WorkflowSidebar extends View {
     this.prs = {};             // repoDir -> { at, list }
     this.ci = {};              // repoDir -> { at, trends, branch }
     this.lastCiSettingsTs = 0;
+    this.lastCiBumpTs = 0;
+    this.lastPrRefreshAt = 0;
     this.loading = new Set();  // repoDirs currently refreshing
     this.lastRefresh = {};     // repoDir -> ms
     this.watches = [];         // active FolderWatch handles to cancel on re-watch/close
@@ -172,7 +175,12 @@ export default class WorkflowSidebar extends View {
     const gdir = this.globalDir();
     if (gdir) this.loadBranchSessions(gdir, cx);
     cx.timer.every(SCAN_MS, cx => this.scanAll(cx));
-    cx.timer.every(PR_MS, cx => this.refreshOpenPrs(cx));
+    cx.timer.every(ACTIVE_PR_MS, cx => {
+      const hasActive = this.hasActiveCi();
+      if (!hasActive && Date.now() - this.lastPrRefreshAt < PR_MS) return;
+      this.lastPrRefreshAt = Date.now();
+      this.refreshOpenPrs(cx);
+    });
     cx.timer.every(10000, cx => this.refreshLiveSessions(cx));
     cx.timer.every(15000, () => { flushTelemetry(); });
     cx.spawn(async cx => { for (;;) { this.command(await nextCommand(), cx); cx.notify(); } });
@@ -765,8 +773,20 @@ export default class WorkflowSidebar extends View {
     }
   }
 
+  hasActiveCi() {
+    for (const r of this.visibleRepos()) {
+      if (!this.openRepos.has(r.dir)) continue;
+      const trends = this.ci[r.dir]?.trends ?? [];
+      if (trends.some(tr => tr.latest?.state === "running" || tr.latest?.state === "queued")) return true;
+      const rows = this.models[r.dir]?.rows ?? [];
+      if (rows.some(row => row.ci?.ci === "running")) return true;
+    }
+    return false;
+  }
+
   // Refreshes PR & CI check status for expanded repos so running pipelines progress live in the sidebar.
   refreshOpenPrs(cx) {
+    this.lastPrRefreshAt = Date.now();
     for (const r of this.visibleRepos()) {
       if (this.openRepos.has(r.dir) && this.models[r.dir]?.slug) {
         this.refreshRepo(r.dir, cx, { prs: true });
@@ -1658,7 +1678,12 @@ export default class WorkflowSidebar extends View {
     const ciCfg = shared("wf.ciSettings");
     if (ciCfg?.ts && ciCfg.ts > this.lastCiSettingsTs) {
       this.lastCiSettingsTs = ciCfg.ts;
-      this.refreshOpenPrs(cx);
+      cx.timer.after(1, cx => this.refreshOpenPrs(cx));
+    }
+    const ciBump = shared("wf.ciBump");
+    if (ciBump?.ts && ciBump.ts > this.lastCiBumpTs) {
+      this.lastCiBumpTs = ciBump.ts;
+      cx.timer.after(1, cx => this.refreshOpenPrs(cx));
     }
 
     const archivedSet = new Set(Array.isArray(shared("wf.archived")) ? shared("wf.archived") : []);

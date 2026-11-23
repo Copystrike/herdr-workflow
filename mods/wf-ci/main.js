@@ -11,8 +11,8 @@ import {
 } from "./lib/wf/index.js";
 import { exec, fs, wf, CI_CACHE_DIR, track, flushTelemetry } from "./lib/wf/herdr-adapter.js";
 
-const ACTIVE_POLL_MS = 25000;
-const IDLE_POLL_MS = 120000;
+const ACTIVE_POLL_MS = 5000;
+const IDLE_POLL_MS = 20000;
 const RECENCY_CHOICES = [3, 7, 14, 30];
 
 function ago(ms) {

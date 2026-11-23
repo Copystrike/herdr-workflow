@@ -4,6 +4,8 @@ A personal developer workflow layout, mod suite, and orchestration CLI for [**he
 
 Turns Herdr into a branch-centric workspace IDE for running AI coding agents alongside a full Git client, GitHub Actions CI inspector, and PowerShell-style terminal ergonomics.
 
+![Workspace overview with 3-tier sidebar, split diff viewer, and Compare panel](docs/screenshots/overview-split-diff.png)
+
 ## Features
 
 - **3-tier collapsible sidebar (`wf-sidebar`)**
@@ -32,6 +34,17 @@ Turns Herdr into a branch-centric workspace IDE for running AI coding agents alo
   - CI and diff tabs cleanly open in their own space even when zero spaces exist and tear down when closed.
 - **Orchestration CLI (`bin/wf.mjs` -> `~/.local/bin/wf`)**
   - JSON-emitting CLI shared by the mods and agent sessions: `wf projects`, `wf list`, `wf status`, `wf new`, `wf open`, `wf send`, `wf logs`, `wf diff`, `wf result`, `wf sessions`, `wf resume`, `wf rename`, `wf stop`, `wf remove-session`, `wf deliver`, `wf ci-jobs`.
+
+## Showcase
+
+### Active-lanes Git History & Agent Sessions
+![History commit graph and live agent terminal](docs/screenshots/git-history-graph.png)
+
+### GitHub Actions CI Inspector
+![TeamCity Sakura-style CI inspector with inline step logs](docs/screenshots/ci-inspector.png)
+
+### All Terminals Settings (PowerShell Right-Click & Newline Key)
+<img src="docs/screenshots/terminal-settings.png" alt="All terminals settings dialog" width="640" />
 
 ## Repository layout
 

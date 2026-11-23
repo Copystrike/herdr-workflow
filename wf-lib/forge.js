@@ -11,6 +11,93 @@ async function ghJson(exec, cwd, args) {
   try { return JSON.parse(r.stdout); } catch { return null; }
 }
 
+// Parses `gh api -i` output (HTTP status line + headers + blank line + JSON body).
+export function parseHttpResponse(raw) {
+  const s = String(raw ?? "");
+  const sep = s.indexOf("\r\n\r\n");
+  const sepLen = sep >= 0 ? 4 : 2;
+  const idx = sep >= 0 ? sep : s.indexOf("\n\n");
+  if (idx < 0) return { status: 0, etag: null, body: s };
+  const head = s.slice(0, idx);
+  const body = s.slice(idx + sepLen);
+  const statusMatch = head.match(/^HTTP\/[\d.]+\s+(\d{3})/m);
+  const status = statusMatch ? Number(statusMatch[1]) : 0;
+  const etagMatch = head.match(/^etag:\s*(.+)$/im);
+  const etag = etagMatch ? etagMatch[1].trim() : null;
+  return { status, etag, body };
+}
+
+// Conditional GitHub REST API GET with ETag (`If-None-Match`):
+// HTTP 304 Not Modified costs 0 GitHub API rate-limit points and returns cached JSON immediately.
+const etagCache = new Map(); // endpoint -> { etag, data }
+
+export async function ghApiConditional(exec, cwd, endpoint) {
+  const prev = etagCache.get(endpoint);
+  const args = ["api", "-i", endpoint];
+  if (prev?.etag) args.push("-H", `If-None-Match: ${prev.etag}`);
+  let r;
+  try { r = await exec("gh", args, { cwd }); } catch { return prev?.data ?? null; }
+  const parsed = parseHttpResponse(r.stdout);
+  if (parsed.status === 304 && prev) return prev.data;
+  if (r.code !== 0 && parsed.status !== 200) return prev?.data ?? null;
+  try {
+    const data = JSON.parse(parsed.body);
+    if (parsed.etag) {
+      if (etagCache.size > 160) etagCache.delete(etagCache.keys().next().value);
+      etagCache.set(endpoint, { etag: parsed.etag, data });
+    }
+    return data;
+  } catch {
+    return prev?.data ?? null;
+  }
+}
+
+// GitHub Event Streams (`gh event listen`, gh >= 2.105): real-time SSE CloudEvents for pull requests.
+export const PR_EVENT_TYPES = [
+  "com.github.pull_request.check_suite.status.changed.v1",
+  "com.github.pull_request.review.submitted.v1",
+  "com.github.pull_request.state.changed.v1",
+  "com.github.pull_request.head.changed.v1",
+  "com.github.pull_request.merge_conflict.v1",
+];
+
+export function parsePrEventOutcome(res) {
+  if (!res) return { status: "error", reason: "no result" };
+  const err = String(res.stderr || "");
+  if (res.code === 8) return { status: "timeout" };
+  if (res.code === 0) {
+    const line = String(res.stdout || "").trim().split("\n").find(Boolean);
+    if (line) {
+      try { return { status: "event", event: JSON.parse(line) }; }
+      catch { return { status: "event", event: { raw: line } }; }
+    }
+    return { status: "timeout" };
+  }
+  if (/not enabled for this account|HTTP 403|HTTP 404|unknown command.*event/i.test(err)) {
+    return { status: "unsupported", reason: err.trim().split("\n").pop() || "event streams unavailable" };
+  }
+  return { status: "error", reason: err.trim().split("\n").pop() || `gh exited ${res.code}` };
+}
+
+export async function listenPrEvent(exec, cwd, prUrl, { timeoutSec = 22 } = {}) {
+  if (!prUrl || !/^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(prUrl)) {
+    return { status: "unsupported", reason: "not a github.com PR URL" };
+  }
+  const args = [
+    "event", "listen",
+    "--resource", prUrl,
+    "--event", PR_EVENT_TYPES.join(","),
+    "--count", "1",
+    "--timeout", `${timeoutSec}s`,
+  ];
+  try {
+    const r = await exec("gh", args, { cwd, timeout: (timeoutSec + 4) * 1000 });
+    return parsePrEventOutcome(r);
+  } catch (e) {
+    return { status: "error", reason: String(e?.message ?? e) };
+  }
+}
+
 // Open PRs with checks, plus recent history without them: asking checks for every closed PR
 // costs ~10 s on a busy repo, the split ~1.5 s. Open PRs win over their lean copies.
 export async function prList(exec, cwd, slug) {
@@ -240,12 +327,11 @@ export async function repoWorkflowMeta(exec, cwd, slug, { force = false } = {}) 
 
 export async function workflowRuns(exec, cwd, slug) {
   if (!slug) return null;
-  const r = await ghJson(exec, cwd, ["api", `repos/${slug}/actions/runs?per_page=40`]);
+  const r = await ghApiConditional(exec, cwd, `repos/${slug}/actions/runs?per_page=40`);
   return Array.isArray(r?.workflow_runs) ? r.workflow_runs : null;
 }
 
-// Fetches recent runs per watched workflow (default branch first, falling back to pull_request runs
-// when a workflow only runs on PRs, matching Termic's ci-watch behavior).
+// Fetches recent runs per watched workflow using ETag conditional requests (304 = 0 rate-limit cost).
 export async function repoCiSnapshot(exec, cwd, slug, rawSettings = null, { forceMeta = false, now = Date.now() } = {}) {
   if (!slug) return null;
   const cfg = mergeCiSettings(rawSettings);
@@ -263,13 +349,13 @@ export async function repoCiSnapshot(exec, cwd, slug, rawSettings = null, { forc
     const preferPr = cachedSrc && Date.now() - cachedSrc.at < SOURCE_TTL_MS && cachedSrc.source === "pr";
 
     if (preferPr) {
-      const prResp = await ghJson(exec, cwd, ["api", `repos/${slug}/actions/workflows/${def.id}/runs?event=pull_request&per_page=${perPage}`]);
+      const prResp = await ghApiConditional(exec, cwd, `repos/${slug}/actions/workflows/${def.id}/runs?event=pull_request&per_page=${perPage}`);
       const prRuns = (Array.isArray(prResp?.workflow_runs) ? prResp.workflow_runs : [])
         .filter(r => !r.head_repository?.full_name || r.head_repository.full_name.toLowerCase() === slug.toLowerCase());
       if (prRuns.length) return { ...def, source: "pr", branch, runs: prRuns };
     }
 
-    const brResp = await ghJson(exec, cwd, ["api", `repos/${slug}/actions/workflows/${def.id}/runs?branch=${encodeURIComponent(branch)}&per_page=${perPage}`]);
+    const brResp = await ghApiConditional(exec, cwd, `repos/${slug}/actions/workflows/${def.id}/runs?branch=${encodeURIComponent(branch)}&per_page=${perPage}`);
     const brRuns = Array.isArray(brResp?.workflow_runs) ? brResp.workflow_runs : [];
     const hasRecentBranch = brRuns.some(r => {
       const ts = Date.parse(r.run_started_at || r.created_at || "");
@@ -279,7 +365,7 @@ export async function repoCiSnapshot(exec, cwd, slug, rawSettings = null, { forc
       workflowSourceCache.set(srcKey, { source: "branch", at: Date.now() });
       return { ...def, source: "branch", branch, runs: brRuns };
     }
-    const prResp = await ghJson(exec, cwd, ["api", `repos/${slug}/actions/workflows/${def.id}/runs?event=pull_request&per_page=${perPage}`]);
+    const prResp = await ghApiConditional(exec, cwd, `repos/${slug}/actions/workflows/${def.id}/runs?event=pull_request&per_page=${perPage}`);
     const prRuns = (Array.isArray(prResp?.workflow_runs) ? prResp.workflow_runs : [])
       .filter(r => !r.head_repository?.full_name || r.head_repository.full_name.toLowerCase() === slug.toLowerCase());
     if (prRuns.length) {
@@ -432,7 +518,7 @@ export async function runJobs(exec, cwd, slug, runId, { cache = null, cacheable 
     const hit = await cache.getJobs(slug, runId, attempt);
     if (hit) return hit;
   }
-  const r = await ghJson(exec, cwd, ["api", `repos/${slug}/actions/runs/${runId}/jobs?per_page=50`]);
+  const r = await ghApiConditional(exec, cwd, `repos/${slug}/actions/runs/${runId}/jobs?per_page=50`);
   const parsed = normalizeJobs(r?.jobs);
   if (cache && cacheable && parsed.length && parsed.every(j => j.state !== "running" && j.state !== "queued")) {
     await cache.setJobs(slug, runId, attempt, parsed);
