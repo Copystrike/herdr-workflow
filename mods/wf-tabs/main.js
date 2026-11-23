@@ -38,6 +38,8 @@ export default class WorkflowTabs extends View {
   init() {
     this.pressed = null;
     this.scroll = ScrollHandle.new();
+    this.autoCollapsedSidebar = false;
+    this.lastReviewMode = false;
     try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
     if (!this.panels || typeof this.panels !== "object" || Array.isArray(this.panels)) this.panels = {};
     this.swipe = { acc: 0, steps: 0, at: 0, last: 0 };
@@ -104,6 +106,10 @@ export default class WorkflowTabs extends View {
     }
   }
 
+  minimizeTab(allSpaces, mainStack) {
+    this.enterEmpty(allSpaces, mainStack);
+  }
+
   closeTab(tabId, space, allSpaces, mainStack) {
     const isLastInSpace = (space?.tabs?.length ?? 0) <= 1;
     if (isLastInSpace) {
@@ -112,7 +118,7 @@ export default class WorkflowTabs extends View {
     run("tab.close", { id: tabId, confirmed: true });
   }
 
-  render() {
+  render(cx) {
     const t = theme();
     const root = layout();
     const mainStack = find(root, "main-stack");
@@ -184,6 +190,7 @@ export default class WorkflowTabs extends View {
     const item = (c, i) => {
       const lead = allPanes.find(p => p.tab === c.id && p.program?.agent) ?? allPanes.find(p => p.tab === c.id);
       const program = lead?.program;
+      const isAiTerminal = Boolean(lead?.terminal && program?.agent);
       const name = label(c, lead);
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
         .when(i <= active, el => el.on_size_change((_size, cx) => { this.scroll.scroll_to_item(active); cx.notify(); }))
@@ -200,12 +207,51 @@ export default class WorkflowTabs extends View {
         .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
         .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
         .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
-        .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop)
-          .on_click((_e, cx) => { cx.stop_propagation(); this.closeTab(c.id, space, allSpaces, mainStack); })
-          .child(svg("mods/pane/close.svg").size(12))));
+        .when(c.active, el => el.child(h_flex().gap(2).items_center().flex_none()
+          .when(isAiTerminal, e => e.child(div().id(`min-${c.id}`).size(18).rounded(4).flex().items_center().justify_center()
+            .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+            .tooltip("Minimize to background (keeps AI session running)")
+            .on_mouse_down("left", stop)
+            .on_mouse_up("left", stop)
+            .on_click((_e, cx) => { cx.stop_propagation(); this.minimizeTab(allSpaces, mainStack); })
+            .child(svg("mods/workspace-chrome/minus.svg").size(11))))
+          .child(div().id(`close-${c.id}`).size(18).rounded(4).flex().items_center().justify_center()
+            .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.ansi1))
+            .tooltip(isAiTerminal ? "Close tab (stops AI session)" : "Close tab")
+            .on_mouse_down("left", stop)
+            .on_mouse_up("left", stop)
+            .on_click((_e, cx) => { cx.stop_propagation(); this.closeTab(c.id, space, allSpaces, mainStack); })
+            .child(svg("mods/pane/close.svg").size(11)))));
     };
 
     const sidebar = find(root, "sidebar"), w = window();
+    // Auto-collapse Herdr's main left sidebar on code-review tabs (Explain / Diff) so code has
+    // full horizontal width, and restore it when switching back to a terminal or other tab.
+    const activeTabObj = !isEmpty && active >= 0 ? shown[active] : null;
+    const isReviewMode = Boolean(activeTabObj && activeTabObj.name === "✦ Explain");
+    if (isReviewMode !== this.lastReviewMode) {
+      this.lastReviewMode = isReviewMode;
+      const curW = sidebar?.size?.px ?? 320;
+      const isNarrow = curW < 160;
+      if (isReviewMode && !isNarrow) {
+        this.autoCollapsedSidebar = true;
+        const railPx = w?.platform === "macos" ? 76 : 44;
+        cx.timer.after(1, () => {
+          setShared("sidebar.width", curW);
+          setShared("sidebar.collapsed", true);
+          run("layout.resize", { id: "sidebar", px: railPx });
+        });
+      } else if (!isReviewMode && this.autoCollapsedSidebar) {
+        this.autoCollapsedSidebar = false;
+        if (isNarrow) {
+          const restoreW = shared("sidebar.width") ?? 320;
+          cx.timer.after(1, () => {
+            setShared("sidebar.collapsed", false);
+            run("layout.resize", { id: "sidebar", px: restoreW });
+          });
+        }
+      }
+    }
     const lightsPadding = w?.platform === "macos" && w.titlebar === "none" && !w.fullscreen && root?.traffic_lights
       ? Math.max(10, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 10;

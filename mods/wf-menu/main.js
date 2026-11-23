@@ -424,6 +424,17 @@ export default class Menu extends View {
     const archiveHint = blockReason ? (dirtyCount > 0 ? `${dirtyCount} uncommitted` : "unverified") : "";
     return v_flex().w_full()
       .child(this.row("wfb-new", svg("mods/workspace-chrome/plus.svg").size(13).text_color(t.foreground), "New", "▸", cx => { this.sub = "new"; cx.notify(); }))
+      .child(this.row("wfb-explain", svg("mods/workspace-chrome/git-compare.svg").size(13).text_color(t.accent), "AI Explain", "", () => {
+        closeOverlay(p.overlay);
+        setShared("wf.openExplainReq", {
+          repo: p.repo || null,
+          repoDir: p.repoDir || null,
+          worktree: p.worktree,
+          branch: p.branch || null,
+          autoRun: true,
+          ts: Date.now(),
+        });
+      }))
       .child(this.sep())
       .child(this.row("wfb-rename", svg("mods/workspace-chrome/square-pen.svg").size(13).text_color(t.muted), "Rename", "", () => this.renameBranch()))
       .when(Boolean(p.branch), el => el.child(this.row("wfb-copy", svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.muted), "Copy branch name", "", cx => this.copy(p.branch, "Branch name", cx))))

@@ -6,6 +6,7 @@
   "background": "canvas",
   "terminal_padding": [14, 12],
   "terminal_menu": "wf-term-menu",
+  "toast": "wf-toast",
   "preview": "layouts/workflow.svg",
   "divider": { "width": 1, "color": "border" },
   "children": [
@@ -82,7 +83,7 @@
             }
           ]
         },
-        { "id": "status", "type": "block", "size": { "px": 28 }, "content": { "mod": "workspace-status" } }
+        { "id": "status", "type": "block", "size": { "px": 28 }, "content": { "mod": "wf-status" } }
       ]
     }
   ]

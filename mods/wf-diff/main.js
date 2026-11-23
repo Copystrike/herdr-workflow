@@ -8,10 +8,11 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Scrollbar, v_virtual_list } from "gpui-base";
 import { exec, readTextFile, theme, settings, shared, setShared, spaces, run, notify, checking } from "herdr";
-import { parseSplitDiff, githubUrlFor } from "./lib/wf/index.js";
+import { parseSplitDiff, githubUrlFor, languageForPath, syntaxPalette, tokenizeCodeLine, dedentDiffRows } from "./lib/wf/index.js";
 
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
 const LS_DIFF_STYLE = "wf-diff.style"; // "split" | "unified"
+const LS_DIFF_WRAP = "wf-diff.wrap";
 const LS_VIEWED = "wf-changes.viewed";
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html", cs: "c" };
 
@@ -29,28 +30,51 @@ export default class WorkflowDiffViewer extends View {
     this.spec = null;
     this.lastFocusTs = 0;
     this.style = loadJson(LS_DIFF_STYLE, "split") === "unified" ? "unified" : "split";
+    this.wrapLines = loadJson(LS_DIFF_WRAP, true) !== false;
     this.viewWhole = false;
     this.loading = false;
     this.error = null;
     this.splitRows = [];
     this.unifiedRows = [];
+    this.splitMinW = 900;
+    this.uniMinW = 600;
+    this.diffVisibleLimit = 220;
     this.diffWidth = 500;
     this.wholeText = null;
     this.wholeLang = "txt";
     this.wholeError = null;
     this.jumpLine = null;
     this.contextLines = 3; // expands when clicking unchanged-lines separator
-    // Retained EditorState created ONLY in init (never inside render!)
-    this.fileEditor = EditorState.new({
+    // Retained EditorState created ONLY outside render (init / async loadContent)!
+    this.editorKey = "";
+    this.fileEditor = this.makeEditor("txt");
+    if (checking()) return;
+    this.syncFromShared(cx, { fromRender: false });
+  }
+
+  makeEditor(lang) {
+    const t = theme();
+    const syn = syntaxPalette(t);
+    this.editorKey = `${lang}|${t.background}|${t.accent}`;
+    return EditorState.new({
       value: "",
-      language: "txt",
+      language: lang,
       readonly: true,
       line_numbers: true,
       font_family: settings().font_family ?? "JetBrains Mono",
       font_size: 12.5,
+      syntax: syn,
     });
-    if (checking()) return;
-    this.syncFromShared(cx, { fromRender: false });
+  }
+
+  ensureEditorFor(path) {
+    const lang = languageForPath(path);
+    const t = theme();
+    const want = `${lang}|${t.background}|${t.accent}`;
+    if (this.editorKey !== want) {
+      if (this.fileEditor?.release) this.fileEditor.release();
+      this.fileEditor = this.makeEditor(lang);
+    }
   }
 
   syncFromShared(cx, { fromRender = false } = {}) {
@@ -147,6 +171,7 @@ export default class WorkflowDiffViewer extends View {
     cx.spawn(async cx => {
       try {
         if (this.viewWhole || s.mode === "file" || s.fresh) {
+          this.ensureEditorFor(s.path);
           const text = await readTextFile(`${s.root}/${s.path}`, { on: s.on ?? null }).catch(() => null);
           if (this.loadSeq !== seq) return;
           if (text === null) {
@@ -169,10 +194,7 @@ export default class WorkflowDiffViewer extends View {
           if (s.fresh && !this.viewWhole && this.wholeText !== null) {
             const lines = this.wholeText.replace(/\n$/, "").split("\n").slice(0, 2000);
             const synthetic = `@@ -0,0 +1,${lines.length} @@\n${lines.map(l => `+${l}`).join("\n")}`;
-            const parsed = parseSplitDiff(synthetic);
-            this.splitRows = parsed.split;
-            this.unifiedRows = parsed.unified;
-            this.diffWidth = Math.max(460, ...lines.map(l => l.length * 7.5 + 80));
+            this.prepareDiffRows(parseSplitDiff(synthetic), s.path);
           }
         }
         if (!this.viewWhole && s.mode !== "file" && !s.fresh) {
@@ -192,11 +214,7 @@ export default class WorkflowDiffViewer extends View {
           const r = await exec("git", [...READ, ...args], { cwd: s.root, on: s.on ?? null });
           if (this.loadSeq !== seq) return;
           if (r.code !== 0) throw new Error((r.stderr || "git diff failed").trim());
-          const parsed = parseSplitDiff(r.stdout);
-          this.splitRows = parsed.split;
-          this.unifiedRows = parsed.unified;
-          const maxLen = parsed.unified.reduce((m, row) => Math.max(m, (row.text ?? row.label ?? "").length), 40);
-          this.diffWidth = Math.max(480, maxLen * 7.4 + 90);
+          this.prepareDiffRows(parseSplitDiff(r.stdout), s.path);
         }
       } catch (e) {
         if (this.loadSeq === seq) this.error = String(e?.message ?? e);
@@ -205,6 +223,34 @@ export default class WorkflowDiffViewer extends View {
         cx.notify();
       }
     });
+  }
+
+  prepareDiffRows(parsed, path) {
+    const split = dedentDiffRows(parsed.split || [], "split");
+    const unified = dedentDiffRows(parsed.unified || [], "unified");
+    let maxS = 60;
+    for (const r of split) {
+      if (r.kind === "gap" || r.kind === "note") continue;
+      if (r.left) {
+        r.left.toks = tokenizeCodeLine(r.left.text ?? "", path);
+        if ((r.left.text || "").length > maxS) maxS = r.left.text.length;
+      }
+      if (r.right) {
+        r.right.toks = tokenizeCodeLine(r.right.text ?? "", path);
+        if ((r.right.text || "").length > maxS) maxS = r.right.text.length;
+      }
+    }
+    let maxU = 60;
+    for (const r of unified) {
+      if (r.kind === "gap" || r.kind === "note") continue;
+      r.toks = tokenizeCodeLine(r.text ?? "", path);
+      if ((r.text || "").length > maxU) maxU = r.text.length;
+    }
+    this.splitRows = split;
+    this.unifiedRows = unified;
+    this.splitMinW = Math.round(maxS * 7.2 + 64) * 2;
+    this.uniMinW = Math.round(maxU * 7.2 + 100);
+    this.diffVisibleLimit = 220;
   }
 
   toggleWholeFile(cx) {
@@ -217,7 +263,18 @@ export default class WorkflowDiffViewer extends View {
     this.loadContent(cx);
   }
 
-  renderSplitRow(row, t, i) {
+  renderHighlightedCode(toks, fallbackText, pal) {
+    const list = Array.isArray(toks) ? toks : tokenizeCodeLine(fallbackText, this.spec?.path || "");
+    if (!list.length) return div().flex_1().min_w(0);
+    if (this.wrapLines) {
+      return h_flex().flex_1().min_w(0).flex_wrap().items_center().overflow_hidden()
+        .children(list.map(tok => div().max_w_full().min_w(0).whitespace_normal().text_color(pal[tok.kind] || pal.plain).child(tok.text)));
+    }
+    return h_flex().flex_1().min_w(0).items_center().overflow_hidden()
+      .children(list.map(tok => div().whitespace_nowrap().text_color(pal[tok.kind] || pal.plain).child(tok.text)));
+  }
+
+  renderSplitRow(row, t, i, pal) {
     if (row.kind === "note") {
       return div().px(14).py(10).text_size(12).text_color(t.dim).child(row.text);
     }
@@ -232,18 +289,18 @@ export default class WorkflowDiffViewer extends View {
       const bg = side?.kind === "-" ? t.ansi1 + "1a" : side?.kind === "+" ? t.ansi2 + "1a" : "#00000000";
       const numCol = side?.kind === "-" ? t.ansi1 : side?.kind === "+" ? t.ansi2 : t.dim;
       const prefix = side?.kind === "-" ? "−" : side?.kind === "+" ? "+" : " ";
-      return h_flex().flex_1().min_w(0).h(21).px(6).gap(8).items_center().bg(bg)
+      return h_flex().flex_1().min_w(0).min_h(21).py(1).px(4).gap(5).items_start().overflow_hidden().bg(bg)
         .when(sideKind === "left", el => el.border_r(1).border_color(t.border))
-        .child(div().w(34).flex_none().text_right().text_size(10.5).text_color(numCol).opacity(side ? 0.75 : 0.2).child(side?.num != null ? String(side.num) : ""))
-        .child(div().w(10).flex_none().text_size(11).text_color(numCol).child(side ? prefix : ""))
-        .child(div().flex_1().min_w(0).truncate().text_color(side ? t.foreground : t.dim).child(side?.text ?? ""));
+        .child(div().w(26).flex_none().text_right().text_size(10).text_color(numCol).opacity(side ? 0.75 : 0.2).child(side?.num != null ? String(side.num) : ""))
+        .child(div().w(8).flex_none().text_size(10.5).text_color(numCol).child(side ? prefix : ""))
+        .child(side ? this.renderHighlightedCode(side.toks, side.text ?? "", pal) : div().flex_1().min_w(0));
     };
-    return h_flex().w_full().flex_none().h(21).items_stretch()
+    return h_flex().w_full().min_w(0).flex_none().min_h(21).items_stretch()
       .child(cell(row.left, "left"))
       .child(cell(row.right, "right"));
   }
 
-  renderUnifiedRow(row, t, i) {
+  renderUnifiedRow(row, t, i, pal) {
     if (row.kind === "note") {
       return div().px(14).py(10).text_size(12).text_color(t.dim).child(row.text);
     }
@@ -257,11 +314,11 @@ export default class WorkflowDiffViewer extends View {
     const bg = row.kind === "+" ? t.ansi2 + "1a" : row.kind === "-" ? t.ansi1 + "1a" : "#00000000";
     const numCol = row.kind === "+" ? t.ansi2 : row.kind === "-" ? t.ansi1 : t.dim;
     const glyph = row.kind === "+" ? "+" : row.kind === "-" ? "−" : " ";
-    return h_flex().w_full().flex_none().h(21).px(8).gap(8).items_center().bg(bg)
-      .child(div().w(32).flex_none().text_right().text_size(10.5).text_color(numCol).opacity(0.75).child(row.oldNum != null ? String(row.oldNum) : ""))
-      .child(div().w(32).flex_none().text_right().text_size(10.5).text_color(numCol).opacity(0.75).child(row.newNum != null ? String(row.newNum) : ""))
-      .child(div().w(10).flex_none().text_color(numCol).child(glyph))
-      .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(row.text ?? ""));
+    return h_flex().w_full().min_w(0).flex_none().min_h(21).py(1).px(6).gap(5).items_start().bg(bg)
+      .child(div().w(28).flex_none().text_right().text_size(10).text_color(numCol).opacity(0.75).child(row.oldNum != null ? String(row.oldNum) : ""))
+      .child(div().w(28).flex_none().text_right().text_size(10).text_color(numCol).opacity(0.75).child(row.newNum != null ? String(row.newNum) : ""))
+      .child(div().w(8).flex_none().text_color(numCol).child(glyph))
+      .child(this.renderHighlightedCode(row.toks, row.text ?? "", pal));
   }
 
   render(cx) {
@@ -297,6 +354,10 @@ export default class WorkflowDiffViewer extends View {
         .when(Boolean(label), el => el.child(div().whitespace_nowrap().child(label)));
 
     const rows = this.style === "split" ? this.splitRows : this.unifiedRows;
+    const pal = syntaxPalette(t);
+    const minRowW = this.style === "split" ? this.splitMinW : this.uniMinW;
+    const visLimit = Math.max(100, this.diffVisibleLimit || 220);
+    const visRows = rows.slice(0, visLimit);
 
     return v_flex().id("wf-diff").track_focus(this.handle).size_full().min_h(0).bg(t.background).text_color(t.foreground)
       // Row 1: Breadcrumb path
@@ -311,7 +372,8 @@ export default class WorkflowDiffViewer extends View {
         .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).tooltip(s.path).child(s.path))
         .when(!this.viewWhole && s.mode !== "file", el => el
           .child(btn("vd-split", "Split", this.style === "split", cx => { this.style = "split"; saveJson(LS_DIFF_STYLE, "split"); cx.notify(); }, { tip: "Side-by-side split diff" }))
-          .child(btn("vd-unified", "Unified", this.style === "unified", cx => { this.style = "unified"; saveJson(LS_DIFF_STYLE, "unified"); cx.notify(); }, { tip: "Inline unified diff" })))
+          .child(btn("vd-unified", "Unified", this.style === "unified", cx => { this.style = "unified"; saveJson(LS_DIFF_STYLE, "unified"); cx.notify(); }, { tip: "Inline unified diff" }))
+          .child(btn("vd-wrap", "Wrap", this.wrapLines, cx => { this.wrapLines = !this.wrapLines; saveJson(LS_DIFF_WRAP, this.wrapLines); cx.notify(); }, { accent: true, tip: "Wrap long code lines" })))
         .when(s.mode !== "file" && s.status !== "D", el => el
           .child(btn("vd-open", this.viewWhole ? "Diff" : "Open", this.viewWhole, cx => this.toggleWholeFile(cx), {
             icon: svg("mods/workspace-chrome/file-text.svg").size(12).text_color(this.viewWhole ? t.accent : t.muted),
@@ -343,10 +405,18 @@ export default class WorkflowDiffViewer extends View {
                 .child("From line 1"))))
             .child(Editor.new(this.fileEditor).flex_1().min_h(0))))
       .when(!this.loading && !this.error && !this.viewWhole && s.mode !== "file", el => el
-        .child(v_flex().id(this.style === "split" ? "wf-diff-split" : "wf-diff-uni").flex_1().min_h(0).overflow_y_scrollbar()
-          .font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
-          .children(rows.length
-            ? rows.slice(0, 2000).map((row, idx) => this.style === "split" ? this.renderSplitRow(row, t, idx) : this.renderUnifiedRow(row, t, idx))
-            : [div().p(16).text_size(12).text_color(t.dim).child("No diff lines")])))
+        .child(v_flex().id(this.style === "split" ? "wf-diff-split" : "wf-diff-uni").flex_1().min_h(0).overflow_y_scrollbar().when(!this.wrapLines, e => e.overflow_x_scrollbar())
+          .font_family(settings().font_family ?? "JetBrains Mono").text_size(this.style === "split" ? 11 : 11.5)
+          .child(v_flex().w_full().when(!this.wrapLines, e => e.min_w(minRowW))
+            .children(visRows.length
+              ? visRows.map((row, idx) => this.style === "split" ? this.renderSplitRow(row, t, idx, pal) : this.renderUnifiedRow(row, t, idx, pal))
+              : [div().p(16).text_size(12).text_color(t.dim).child("No diff lines")])
+            .when(rows.length > visRows.length, e => e.child(h_flex().id("vd-diff-more").w_full().flex_none().px(14).py(12).gap(8).items_center().justify_center()
+              .bg(t.raised + "77").border_t(1).border_color(t.border)
+              .child(div().text_size(11.2).text_color(t.dim).child(`Showing ${visRows.length} of ${rows.length} lines`))
+              .child(div().id("vd-diff-more-btn").px(10).h(24).rounded(5).flex().items_center().text_size(11).font_medium().cursor_pointer()
+                .bg(t.solid).text_color(t.solid_foreground).hover(st => st.opacity(0.9))
+                .on_click((_e, cx) => { this.diffVisibleLimit = visRows.length + 250; cx.notify(); })
+                .child(`Show ${Math.min(250, rows.length - visRows.length)} more`)))))))
   }
 }

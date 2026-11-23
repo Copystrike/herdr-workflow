@@ -27,12 +27,16 @@ done
 # The wf CLI the mods and orchestrators call, with the wf-lib it imports, plus ~/.local/bin/wf on PATH.
 mkdir -p "$HOME_DIR/wf"
 rsync -a --delete --exclude README.md --exclude herdr-adapter.js bin wf-lib "$HOME_DIR/wf/"
-chmod +x "$HOME_DIR/wf/bin/wf.mjs" "$HOME_DIR/wf/bin/claude" 2>/dev/null || true
+chmod +x "$HOME_DIR/wf/bin/wf.mjs" "$HOME_DIR/wf/bin/claude" "$HOME_DIR/wf/bin/usage-hook.mjs" 2>/dev/null || true
 mkdir -p "$HOME/.local/bin"
 ln -sf "$HOME_DIR/wf/bin/wf.mjs" "$HOME/.local/bin/wf"
 
 for l in layouts/*.json; do cp "$l" "$HOME_DIR/layouts/$(basename "$l")"; done
 for s in layouts/*.svg; do [ -e "$s" ] && cp "$s" "$HOME_DIR/layouts/"; done
+if [ -d themes ]; then
+  mkdir -p "$HOME_DIR/themes"
+  for th in themes/*.json; do [ -e "$th" ] && cp "$th" "$HOME_DIR/themes/$(basename "$th")"; done
+fi
 
 status=0
 for out in build/mods/*/; do

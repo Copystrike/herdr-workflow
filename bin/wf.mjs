@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { exec, fs } from "./node-adapter.mjs";
 import * as wf from "../wf-lib/index.js";
 import { listSessions, projectDirsOf, repoSessionDirs, insideRepo, lastAnswerOf, copySessionInto, claudeConfigDir, sessionTitleOf, setTranscriptTitle, removeSessionFiles } from "./sessions.mjs";
+import { runExplain } from "./explain.mjs";
 
 // Starts claude without a parent session's markers; see bin/claude.
 const CLAUDE = fileURLToPath(new URL("./claude", import.meta.url));
@@ -645,8 +646,33 @@ try {
     if (!opts.slug || !opts.runs) fail("--slug and --runs are required");
     const ids = String(opts.runs).split(",").map(s => s.trim()).filter(Boolean).slice(0, 12);
     out(await ciJobsBatch(opts.slug, ids));
+  } else if (command === "explain") {
+    if (!opts.worktree) fail("--worktree is required");
+    out(await runExplain({
+      worktree: opts.worktree,
+      base: typeof opts.base === "string" ? opts.base : null,
+      engine: typeof opts.engine === "string" ? opts.engine : null,
+      model: typeof opts.model === "string" ? opts.model : undefined,
+      effort: typeof opts.effort === "string" ? opts.effort : null,
+      lang: typeof opts.lang === "string" ? opts.lang : null,
+      bugHuntMin: opts["bug-hunt-min"] !== undefined ? opts["bug-hunt-min"] : null,
+      ask: typeof opts.ask === "string" ? opts.ask : null,
+      scopeType: typeof opts["scope-type"] === "string" ? opts["scope-type"] : null,
+      scopeId: typeof opts["scope-id"] === "string" ? opts["scope-id"] : null,
+      scopeLabel: typeof opts["scope-label"] === "string" ? opts["scope-label"] : null,
+      status: !!opts.status,
+      full: !!opts.full,
+      bg: !!opts.bg,
+      cancel: !!opts.cancel,
+      jobWorker: !!opts["job-worker"],
+      resolve: typeof opts.resolve === "string" ? opts.resolve : null,
+      unresolve: !!opts.unresolve,
+      deleteQa: typeof opts["delete-qa"] === "string" ? opts["delete-qa"] : null,
+      clearQa: !!opts["clear-qa"],
+      clearOutdatedQa: !!opts["clear-outdated-qa"],
+    }));
   } else {
-    fail("usage: wf open|stop|remove-session|rename|resume|sessions|answer|projects|list|status|new|deliver|send|logs|diff|result|ci-jobs");
+    fail("usage: wf open|stop|remove-session|rename|resume|sessions|answer|projects|list|status|new|deliver|send|logs|diff|result|ci-jobs|explain");
   }
 } catch (e) {
   fail(e.message);

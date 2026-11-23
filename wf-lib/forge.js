@@ -378,6 +378,65 @@ export async function repoCiSnapshot(exec, cwd, slug, rawSettings = null, { forc
   return { slug, defaultBranch: meta.defaultBranch, branch, allWorkflows: meta.workflows, workflows };
 }
 
+// Fetches all GitHub Actions runs specifically for one branch (any workflow, not limited
+// to the repo's pinned overview workflows) and groups them into the same snapshot shape
+// consumed by ciTrends(). Uses ETag conditional caching (304 = 0 rate-limit cost).
+export async function branchCiSnapshot(exec, cwd, slug, branch, rawSettings, { forceMeta = false } = {}) {
+  if (!slug || !branch) return null;
+  const cfg = mergeCiSettings(rawSettings);
+  const [meta, resp] = await Promise.all([
+    repoWorkflowMeta(exec, cwd, slug, { force: forceMeta }),
+    ghApiConditional(exec, cwd, `repos/${slug}/actions/runs?branch=${encodeURIComponent(branch)}&per_page=30`),
+  ]);
+  const runs = Array.isArray(resp?.workflow_runs) ? resp.workflow_runs : [];
+  const ov = cfg.overrides?.[slug] || null;
+  const shorts = {};
+  for (const w of cfg.workflows) if (w?.name && w?.short) shorts[w.name.toLowerCase()] = w.short;
+  for (const [k, v] of Object.entries(cfg.shorts ?? {})) if (v) shorts[k.toLowerCase()] = v;
+  for (const [k, v] of Object.entries(ov?.shorts ?? {})) if (v) shorts[k.toLowerCase()] = v;
+
+  const byWf = new Map();
+  for (const r of runs) {
+    const name = r.name || r.workflow_name || `Workflow #${r.workflow_id || "?"}`;
+    const key = String(r.workflow_id || name);
+    let entry = byWf.get(key);
+    if (!entry) {
+      entry = {
+        id: r.workflow_id ?? null,
+        name,
+        short: shorts[name.toLowerCase()] || defaultShortName(name),
+        source: "branch",
+        branch,
+        runs: [],
+      };
+      byWf.set(key, entry);
+    }
+    entry.runs.push(r);
+  }
+
+  const stateRank = r => {
+    const st = String(r?.status || "").toLowerCase();
+    const c = String(r?.conclusion || "").toLowerCase();
+    if (st === "in_progress" || st === "queued" || st === "waiting" || st === "pending") return 2;
+    if (c === "failure" || c === "timed_out" || c === "startup_failure") return 3;
+    return 1;
+  };
+  const workflows = [...byWf.values()].sort((a, b) => {
+    const ra = stateRank(a.runs[0]), rb = stateRank(b.runs[0]);
+    if (ra !== rb) return rb - ra;
+    return Date.parse(b.runs[0]?.created_at || 0) - Date.parse(a.runs[0]?.created_at || 0);
+  });
+
+  return {
+    slug,
+    defaultBranch: meta?.defaultBranch || "main",
+    branch,
+    scope: "branch",
+    allWorkflows: meta?.workflows || [],
+    workflows,
+  };
+}
+
 function normalizeRunBar(wfName, r, { now, cutoffMs }) {
   const st = String(r.status || "").toLowerCase();
   const concl = String(r.conclusion || "").toLowerCase();

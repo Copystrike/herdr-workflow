@@ -95,6 +95,7 @@ export default class WorkflowChanges extends View {
     this.behind = 0;
     this.pr = null;
     this.prCi = null;
+    this.explainStatus = null; // { cached, staleCount }
     this.watched = null;
     this.loading = false;
     this.busy = false;
@@ -380,6 +381,78 @@ export default class WorkflowChanges extends View {
     cx.notify();
   }
 
+  openExplainTab(cx, { autoRun = false } = {}) {
+    if (!this.root) return;
+    const branchLabel = this.headBranch || location().branch || "HEAD";
+    const tabTitle = `✦ Explain`;
+    setShared("wf.explainFocus", {
+      root: this.root,
+      branch: branchLabel,
+      baseRef: this.compareBase || null,
+      baseSha: this.compareBaseSha || null,
+      autoRun,
+      ts: Date.now(),
+    });
+
+    const allSpaces = spaces() ?? [];
+    const worktreeSpace = spaceForWorktree(allSpaces, panes() ?? [], this.root);
+    const activeSpace = !shared("wf.emptyView")?.on ? allSpaces.find(s => s.active) : null;
+    const targetSpace = worktreeSpace || activeSpace;
+
+    // Reuse an existing Explain tab inside this branch's own space (never jump to another branch's space!)
+    if (targetSpace) {
+      const hit = (targetSpace.tabs ?? []).find(tb => tb.name === tabTitle);
+      if (hit) {
+        setShared("wf.emptyView", null);
+        setShared("wf.navTs", Date.now());
+        run("layout.select", { stack: "main-stack", child: "active-tab" });
+        if (!targetSpace.active) run("space.select", { id: targetSpace.id });
+        run("tab.select", { id: hit.id });
+        cx.notify();
+        return;
+      }
+    }
+
+    if (this.openingExplain) return;
+    this.openingExplain = true;
+
+    cx.spawn(async cx => {
+      try {
+        if (targetSpace) {
+          const r = await exec("herdr-app", ["do", "tab.new", JSON.stringify({ space: targetSpace.id, name: tabTitle, mod: "wf-explain", focus: true })]);
+          const created = r.code === 0 ? JSON.parse(r.stdout || "{}") : null;
+          if (created?.tab) setShared("wf.explainTabId", created.tab);
+          setShared("wf.emptyView", null);
+          setShared("wf.navTs", Date.now());
+          run("layout.select", { stack: "main-stack", child: "active-tab" });
+          if (!targetSpace.active) run("space.select", { id: targetSpace.id });
+        } else {
+          const spRes = await exec("herdr-app", ["do", "space.new", JSON.stringify({ name: tabTitle, tab: "__wf_boot__", folder: this.root, focus: false })]);
+          const sp = spRes.code === 0 ? JSON.parse(spRes.stdout || "{}") : null;
+          if (!sp?.space) throw new Error((spRes.stderr || spRes.stdout || "space.new failed").trim());
+          const tbRes = await exec("herdr-app", ["do", "tab.new", JSON.stringify({ space: sp.space, name: tabTitle, mod: "wf-explain", focus: true })]);
+          const tb = tbRes.code === 0 ? JSON.parse(tbRes.stdout || "{}") : null;
+          if (tb?.tab) setShared("wf.explainTabId", tb.tab);
+          if (sp.tab) await exec("herdr-app", ["do", "tab.close", JSON.stringify({ id: sp.tab, confirmed: true })]);
+          if (sp.terminal) {
+            await exec("hc", ["kill", sp.terminal]).catch(() => {});
+            await exec("hc", ["rm", sp.terminal]).catch(() => {});
+          }
+          setShared("wf.emptyView", null);
+          setShared("wf.navTs", Date.now());
+          run("layout.select", { stack: "main-stack", child: "active-tab" });
+          run("space.select", { id: sp.space });
+        }
+      } catch (e) {
+        notify({ title: "Could not open AI Explain", body: String(e?.message ?? e), level: "error" });
+      } finally {
+        this.openingExplain = false;
+        cx.notify();
+      }
+    });
+    cx.notify();
+  }
+
   // ------------------------------------------------------------------ data loaders
 
   refresh(cx, { quiet = false } = {}) {
@@ -395,6 +468,7 @@ export default class WorkflowChanges extends View {
       this.behind = 0;
       this.pr = null;
       this.prCi = null;
+      this.explainStatus = null;
       this.staged = [];
       this.unstaged = [];
       this.refs = { local: [], remote: [] };
@@ -475,6 +549,7 @@ export default class WorkflowChanges extends View {
         if (this.slug && this.headBranch && (changed || !quiet || Date.now() - this.lastPrPollAt > 15000)) {
           this.loadPr(root, this.slug, this.headBranch, context, cx);
         }
+        this.loadExplainStatus(root, context, cx);
         // Load Compare refs/files and active tab data so switching tabs is instant & never empty.
         await Promise.all([
           this.loadCompareAsync(context, cx),
@@ -486,6 +561,21 @@ export default class WorkflowChanges extends View {
         if (locKey() === context) this.loading = false;
         cx.notify();
       }
+    });
+  }
+
+  loadExplainStatus(root, context, cx) {
+    if (!root || this.on) return;
+    cx.spawn(async cx => {
+      try {
+        const r = await exec("wf", ["explain", "--worktree", root, "--status"], { cwd: root });
+        if (locKey() !== context || r.code !== 0) return;
+        const d = JSON.parse(r.stdout.trim().split("\n").pop() || "{}");
+        if (d?.ok) {
+          this.explainStatus = { cached: Boolean(d.cached), staleCount: Number(d.staleCount || 0) };
+          cx.notify();
+        }
+      } catch {}
     });
   }
 
@@ -1036,25 +1126,47 @@ export default class WorkflowChanges extends View {
     const checks = (ci?.checks ?? []).slice(0, 12);
     const barCol = s => s === "failed" ? "#ef4444" : s === "passed" ? "#22c55e" : s === "running" ? "#16a34a" : s === "queued" ? "#15803d" : t.dim;
 
-    return v_flex().id("git-pr-card").flex_none().px(10).py(6).gap(3).bg(t.raised + "55").border_b(1).border_color(t.border).cursor_pointer()
-      .hover(s => s.bg(t.hover))
-      .tooltip(ci?.tooltip ? `${ci.tooltip}\nClick to open PR #${pr.number} on GitHub` : `Open PR #${pr.number} on GitHub`)
-      .on_click((_e, cx) => { if (pr.url) cx.open_url(pr.url); })
+    const openCiInHerdr = (_e, cx) => {
+      cx.stop_propagation();
+      if (this.slug) {
+        setShared("wf.openCiReq", {
+          repo: shared("wf.branch")?.repo || this.slug.split("/").pop(),
+          dir: this.root,
+          slug: this.slug,
+          branch: this.headBranch || location().branch || null,
+          tab: "overview",
+          ts: Date.now(),
+        });
+      }
+    };
+
+    return v_flex().id("git-pr-card").flex_none().px(10).py(6).gap(3).bg(t.raised + "55").border_b(1).border_color(t.border)
       .child(h_flex().gap(7).items_center()
-        .child(h_flex().gap(3).items_center()
+        .child(h_flex().id("git-pr-open").gap(3).items_center().px(2).rounded(4).cursor_pointer().hover(s => s.bg(t.hover))
+          .tooltip(`Open PR #${pr.number} on GitHub`)
+          .on_click((_e, cx) => { if (pr.url) cx.open_url(pr.url); })
           .child(svg("mods/workspace-chrome/git-branch.svg").size(11).text_color(stateCol))
           .child(div().text_size(10.8).font_medium().text_color(stateCol).child(stateLabel)))
-        .when(Boolean(ciLabel), el => el.child(h_flex().gap(4).items_center()
+        .when(Boolean(ciLabel), el => el.child(h_flex().id("git-pr-ci").gap(4).px(4).h(17).rounded(4).items_center().cursor_pointer()
+          .hover(s => s.bg(t.hover))
+          .tooltip(`${ci?.tooltip ?? "CI status"}\nClick to open CI in Herdr`)
+          .on_click(openCiInHerdr)
           .child(div().size(6).rounded_full().bg(ciCol)
             .when(ci?.ci === "running", d => d.loop("opacity", { from: 0.35, to: 1, period: 1000 })))
           .child(div().text_size(10.5).text_color(ciCol).child(ciLabel))))
         .when(Boolean(revLabel), el => el.child(div().text_size(10.5).text_color(revCol).child(revLabel)))
         .child(div().flex_1())
-        .when(checks.length > 0, el => el.child(h_flex().h(12).gap(2).items_end()
+        .when(checks.length > 0, el => el.child(h_flex().id("git-pr-bars").h(16).px(3).gap(2).rounded(4).items_end().pb(2).cursor_pointer()
+          .hover(s => s.bg(t.hover))
+          .tooltip(`${ci?.tooltip ?? "CI checks"}\nClick to open CI in Herdr`)
+          .on_click(openCiInHerdr)
           .children(checks.map((ck, idx) =>
             div().id(`prck-${idx}`).w(3).h(Math.max(3, Math.round((ck.ratio ?? 0.5) * 12))).rounded(1).bg(barCol(ck.state))
               .when(ck.state === "running" || ck.state === "queued", d => d.loop("opacity", { from: 0.4, to: 1, period: 1000 })))))))
-      .child(div().truncate().text_size(11.2).text_color(t.muted).child(`#${pr.number} ${pr.title || ""}`));
+      .child(div().id("git-pr-title").truncate().text_size(11.2).text_color(t.muted).cursor_pointer().hover(s => s.text_color(t.foreground))
+        .tooltip(`Open PR #${pr.number} on GitHub`)
+        .on_click((_e, cx) => { if (pr.url) cx.open_url(pr.url); })
+        .child(`#${pr.number} ${pr.title || ""}`));
   }
 
   renderCommitTab(t) {
@@ -1377,6 +1489,24 @@ export default class WorkflowChanges extends View {
         .when(this.behind > 0, el => el.child(syncBtn("git-pull", `↓${this.behind}`, "git pull --ff-only", "pull")))
         .when(this.ahead > 0, el => el.child(syncBtn("git-push-top", `↑${this.ahead}`, "git push", "push")))
         .child(syncBtn("git-fetch", "Fetch", "git fetch --prune", "fetch"))
+        .child((() => {
+          const es = this.explainStatus;
+          const saved = Boolean(es?.cached);
+          const stale = saved ? (es.staleCount || 0) : 0;
+          const col = !saved ? t.accent : stale > 0 ? t.blocked : t.ansi2;
+          const lbl = !saved ? "✦ Explain" : stale > 0 ? `✦ Explain · ${stale}` : "✦ Explain ✓";
+          const tip = !saved
+            ? "Generate local AI Change Stack review (saved to disk)"
+            : stale > 0
+            ? `Open saved explanation (${stale} changed since last run; incremental update only re-analyzes those)`
+            : "Open saved explanation from disk (instant, 0 credits)";
+          return div().id("git-explain").px(6).h(20).rounded(4).flex().items_center().text_size(10).font_medium().cursor_pointer().flex_none()
+            .bg(col + "20").border(1).border_color(col + "55").text_color(col)
+            .hover(s => s.bg(col + "33"))
+            .tooltip(tip)
+            .on_click((_e, cx) => this.openExplainTab(cx))
+            .child(lbl);
+        })())
         .child(div().id("git-refresh").size(20).rounded(4).flex().items_center().justify_center().text_size(11.5).text_color(t.dim).cursor_pointer()
           .hover(s => s.bg(t.hover).text_color(t.foreground)).tooltip("Refresh git state")
           .on_click((_e, cx) => this.refresh(cx)).child("↻")))

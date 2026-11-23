@@ -15,3 +15,6 @@ export * from "./agent.js";
 export * from "./sessions.js";
 export * from "./launch.js";
 export * from "./terminal.js";
+export * from "./explain.js";
+export * from "./usage.js";
+export * from "./syntax.js";

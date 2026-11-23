@@ -6,7 +6,7 @@ import { v_flex, h_flex, InputState, Input, EditorState, Editor } from "gpui-bas
 import { theme, shared, setShared, notify, checking, nextCommand } from "herdr";
 import {
   DEFAULT_CI_SETTINGS, mergeCiSettings, defaultShortName, repoInfo,
-  repoCiSnapshot, ciTrends, runJobs, jobAnnotations, runLog, sliceStepLog, rerunWorkflow, formatDuration,
+  repoCiSnapshot, branchCiSnapshot, ciTrends, runJobs, jobAnnotations, runLog, sliceStepLog, rerunWorkflow, formatDuration,
   createCiCache, isCacheableState, pickDefaultJob, logCacheKey,
 } from "./lib/wf/index.js";
 import { exec, fs, wf, CI_CACHE_DIR, track, flushTelemetry } from "./lib/wf/herdr-adapter.js";
@@ -24,18 +24,23 @@ function ago(ms) {
   return `${Math.round(s / 86400)}d ago`;
 }
 
+function withAlpha(hex, aa) {
+  const s = String(hex || "#888888");
+  return s.length === 9 && s.startsWith("#") ? s.slice(0, 7) + aa : s.length === 7 && s.startsWith("#") ? s + aa : s;
+}
+
 function barColor(t, state) {
   if (state === "failed") return "#ef4444";
   if (state === "passed") return "#22c55e";
   if (state === "queued") return "#15803d";
   if (state === "running") return "#16a34a";
-  return t.dim + "77";
+  return t.dim;
 }
 
 function statusBadge(t, state) {
   const col = barColor(t, state);
   const label = state === "passed" ? "passed" : state === "failed" ? "failed" : state === "running" ? "running" : state === "queued" ? "queued" : state || "unknown";
-  return h_flex().px(6).h(18).rounded(4).gap(4).items_center().bg(col + "22").border(1).border_color(col + "55")
+  return h_flex().px(6).h(18).rounded(4).gap(4).items_center().bg(withAlpha(col, "22")).border(1).border_color(withAlpha(col, "55"))
     .child(div().size(6).rounded_full().bg(col).when(state === "running" || state === "queued", el => el.loop("opacity", { from: 0.4, to: 1, period: 1200 })))
     .child(div().text_size(10).font_semibold().text_color(col).child(label));
 }
@@ -54,6 +59,8 @@ export default class WorkflowCiTab extends View {
 
     this.selectedWorkflow = props?.workflow || focusInit?.workflow || null;
     this.selectedRunId = props?.runId || focusInit?.runId || null;
+    this.branchScope = (!this.selectedWorkflow && (props?.branch || focusInit?.branch)) || null;
+    this.focusBranch = this.branchScope;
     this.inspectorView = "summary"; // "summary" (fast jobs/steps/errors) | "logs" (on-demand Editor logs)
     this.jobsByRun = {};        // runId -> { loading, list }
     this.openJobs = new Map();  // jobId -> boolean (override; default: expanded so all steps are visible)
@@ -117,10 +124,10 @@ export default class WorkflowCiTab extends View {
 
   // Paints cached snapshot + jobs + logs immediately (<15ms) while live refresh runs in the background.
   hydrateFromCache(cx) {
-    if (!this.slug) return;
+    if (!this.slug || this.branchScope) return;
     cx.spawn(async cx => {
       const snap = await this.cache.getSnapshot(this.slug);
-      if (!snap || this.snapshot) return;
+      if (!snap || this.snapshot || this.branchScope) return;
       this.applySnapshot(snap, cx, { selectRunId: this.selectedRunId });
     });
   }
@@ -131,6 +138,22 @@ export default class WorkflowCiTab extends View {
     this.ensureShortInputs();
     this.trends = ciTrends(snap, { limit: cfg.runsPerWorkflow, recencyDays: cfg.recencyDays });
     this.error = null;
+
+    if (this.focusBranch && !selectRunId) {
+      const br = this.focusBranch;
+      const candidates = [];
+      for (const tr of this.trends) {
+        const latestOnBranch = [...tr.bars].reverse().find(b => b.branch === br);
+        if (latestOnBranch) candidates.push({ wfName: tr.name, bar: latestOnBranch });
+      }
+      if (candidates.length) {
+        const rank = s => s === "failed" ? 3 : (s === "running" || s === "queued") ? 2 : 1;
+        candidates.sort((a, b) => rank(b.bar.state) - rank(a.bar.state) || (b.bar.createdMs ?? 0) - (a.bar.createdMs ?? 0));
+        this.selectedWorkflow = candidates[0].wfName;
+        this.selectedRunId = candidates[0].bar.id;
+        this.focusBranch = null;
+      }
+    }
 
     if (!this.selectedWorkflow || !this.trends.some(tr => tr.name === this.selectedWorkflow)) {
       this.selectedWorkflow = this.trends[0]?.name ?? null;
@@ -251,12 +274,16 @@ export default class WorkflowCiTab extends View {
           return;
         }
         const cfg = this.ciSettings();
-        const snap = await repoCiSnapshot(exec, this.dir || ".", this.slug, cfg, { forceMeta });
+        const scopeBranch = this.branchScope;
+        const snap = scopeBranch
+          ? await branchCiSnapshot(exec, this.dir || ".", this.slug, scopeBranch, cfg, { forceMeta })
+          : await repoCiSnapshot(exec, this.dir || ".", this.slug, cfg, { forceMeta });
+        if (this.branchScope !== scopeBranch) return;
         if (!snap) {
           if (!this.snapshot) this.error = `Could not fetch GitHub Actions runs for ${this.slug}.`;
           return;
         }
-        await this.cache.setSnapshot(this.slug, snap);
+        if (!scopeBranch) await this.cache.setSnapshot(this.slug, snap);
         this.lastPollAt = Date.now();
         this.applySnapshot(snap, cx, { selectRunId });
         this.warmLatestJobs(cx);
@@ -1113,19 +1140,48 @@ export default class WorkflowCiTab extends View {
     try {
       const t = theme();
 
-      // Handle cross-tab jump requests from wf-sidebar (when clicking a workflow pill/bar/gear while this tab is already open)
+      // Handle cross-tab jump requests from wf-sidebar / wf-changes while this tab is already open
       const focusReq = shared("wf.ciFocus");
       if (focusReq?.ts && focusReq.ts > this.lastFocusTs && focusReq.slug === this.slug) {
         this.lastFocusTs = focusReq.ts;
         if (focusReq.tab === "settings") {
           this.tab = "settings";
-          cx.spawn(async cx => { this.openSettingsTab(cx); });
+          cx.timer.after(1, cx => { this.openSettingsTab(cx); });
         } else {
           this.tab = "overview";
           if (focusReq.workflow) {
             const wfName = focusReq.workflow;
             const runId = focusReq.runId ?? null;
-            cx.spawn(async cx => { this.selectWorkflow(wfName, cx, runId); });
+            cx.timer.after(1, cx => {
+              if (this.branchScope) {
+                this.branchScope = null;
+                this.selectedWorkflow = wfName;
+                this.selectedRunId = runId;
+                this.refresh(cx);
+              } else {
+                this.selectWorkflow(wfName, cx, runId);
+              }
+            });
+          } else if (focusReq.branch) {
+            const br = focusReq.branch;
+            cx.timer.after(1, cx => {
+              this.branchScope = br;
+              this.focusBranch = br;
+              this.selectedWorkflow = null;
+              this.selectedRunId = null;
+              this.trends = [];
+              this.snapshot = null;
+              this.refresh(cx);
+            });
+          } else {
+            cx.timer.after(1, cx => {
+              if (this.branchScope) {
+                this.branchScope = null;
+                this.selectedWorkflow = null;
+                this.selectedRunId = null;
+                this.refresh(cx);
+              }
+            });
           }
         }
       }
@@ -1143,7 +1199,13 @@ export default class WorkflowCiTab extends View {
           .child(svg("mods/wf-sidebar/icons/workflow.svg").size(15).flex_none().text_color(t.accent))
           .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child((this.repo || this.slug || "CI Pipelines").toUpperCase()))
           .when(Boolean(this.slug), el => el.child(div().px(6).h(18).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).flex().items_center().child(this.slug)))
-          .when(Boolean(this.snapshot?.branch), el => el.child(div().px(6).h(18).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).flex().items_center().child(`branch: ${this.snapshot.branch}`)))
+          .when(Boolean(this.branchScope), el => el.child(h_flex().id("ci-clear-br").px(7).h(20).gap(5).rounded(4).bg(t.accent + "22").border(1).border_color(t.accent + "55").items_center().cursor_pointer()
+            .hover(s => s.bg(t.accent + "33"))
+            .tooltip("Showing CI runs for this branch only — click to view all repo CI")
+            .on_click((_e, cx) => { this.branchScope = null; this.focusBranch = null; this.selectedWorkflow = null; this.selectedRunId = null; this.refresh(cx); })
+            .child(div().max_w(260).truncate().text_size(10.5).text_color(t.accent).child(`branch: ${this.branchScope}`))
+            .child(div().text_size(10.5).text_color(t.accent).child("×"))))
+          .when(!this.branchScope && Boolean(this.snapshot?.branch), el => el.child(div().px(6).h(18).rounded(4).bg(t.accent + "22").text_size(10.5).text_color(t.accent).flex().items_center().child(`branch: ${this.snapshot.branch}`)))
           .child(div().flex_1())
           .child(tabBtn("ci-tab-ov", "Overview", this.tab === "overview", cx => { this.tab = "overview"; cx.notify(); }))
           .child(tabBtn("ci-tab-set", "Settings", this.tab === "settings", cx => this.openSettingsTab(cx)))

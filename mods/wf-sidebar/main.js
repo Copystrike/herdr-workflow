@@ -13,6 +13,7 @@ import {
 import {
   listRepos, gatherRepo, prList, prCiSummary, repoCiSnapshot, ciTrends, mergeCiSettings, formatDuration,
   applyAgents, groupRows, applyBranchOrder, reorderBranchList, counts, spaceForWorktree, readLabels, terminalsAt, statusWord, isWithin, chipLabel, sessionNameFor,
+  worktreeStatus, archiveBlockReason,
 } from "./lib/wf/index.js";
 import { exec, fs, wf, setting, loadLocalConfig, track, flushTelemetry } from "./lib/wf/herdr-adapter.js";
 import { Launcher } from "./launcher.js";
@@ -28,6 +29,7 @@ const OTHERS_SHOWN = 120;
 const STORE_OPEN_REPOS = "wf-sidebar.open-repos";
 const STORE_OPEN_BRANCHES = "wf-sidebar.open-branches";
 const STORE_OPEN_EVERYTHING = "wf-sidebar.open-everything";
+const STORE_NOTIFIED_MERGED = "wf-sidebar.notified-merged";
 const BLOCKER_TEXT = { conflict: "conflict", ci: "CI red", changes: "changes" };
 
 function findNode(node, id) {
@@ -112,12 +114,16 @@ export default class WorkflowSidebar extends View {
     this.models = {};          // repoDir -> gatherRepo model
     this.prs = {};             // repoDir -> { at, list }
     this.ci = {};              // repoDir -> { at, trends, branch }
+    this.branchExplain = {};   // worktreePath -> { cached, staleCount }
     this.lastCiSettingsTs = 0;
     this.lastCiBumpTs = 0;
+    this.lastArchiveReqTs = 0;
     this.lastPrRefreshAt = 0;
+    this.notifiedMerged = loadSet(STORE_NOTIFIED_MERGED) ?? new Set();
     this.loading = new Set();  // repoDirs currently refreshing
     this.lastRefresh = {};     // repoDir -> ms
     this.watches = [];         // active FolderWatch handles to cancel on re-watch/close
+    this.watchedKey = "";      // fingerprint of currently watched dirs to avoid redundant churn
     this.discovered = [];      // all repos discovered under wf.workspaces (for Manage drawer)
     this.manage = false;
     this.statusFilter = null;  // null | "needs" | "running"
@@ -196,6 +202,7 @@ export default class WorkflowSidebar extends View {
       try { w.cancel?.(); } catch { /* ignore */ }
     }
     this.watches = [];
+    this.watchedKey = "";
     this.watchGen = (this.watchGen ?? 0) + 1;
   }
 
@@ -349,6 +356,7 @@ export default class WorkflowSidebar extends View {
       this.models[dir] = model;
       this.lastRefresh[dir] = Date.now();
       track("refresh", { mod: "wf-sidebar", repo: repo.name, ms: Date.now() - t0, count: model.rows.length });
+      this.notifyMergedBranches(repo, model);
 
       // Refresh sessions for any currently expanded branches in this repo.
       for (const row of model.rows) {
@@ -378,30 +386,99 @@ export default class WorkflowSidebar extends View {
     }
   }
 
+  // Posts a persistent, dismissible Termic-style toast whenever an unarchived branch's PR is merged
+  // so you can archive it in one click (still respecting the dirty-worktree archive guard).
+  notifyMergedBranches(repo, model) {
+    if (!model?.rows?.length) return;
+    const archived = new Set(Array.isArray(shared("wf.archived")) ? shared("wf.archived") : []);
+    const dismissed = new Set(Array.isArray(shared("wf.mergedDismissed")) ? shared("wf.mergedDismissed") : []);
+    for (const row of model.rows) {
+      if (row.isBase || archived.has(row.path)) continue;
+      if (row.pr?.state !== "MERGED" || !row.pr?.number) continue;
+      const key = `${model.slug || repo.dir}#${row.pr.number}:${row.path}`;
+      if (this.notifiedMerged.has(key) || dismissed.has(key)) continue;
+      this.notifiedMerged.add(key);
+      saveSet(STORE_NOTIFIED_MERGED, this.notifiedMerged);
+      notify({
+        title: `PR #${row.pr.number} merged`,
+        body: row.branch,
+        level: "warning",
+        timeout: 86400000,
+        action: {
+          name: "wf-sidebar.archive",
+          args: {
+            button: "Archive",
+            dismissKey: key,
+            worktree: row.path,
+            repo: repo.name,
+            branch: row.branch,
+            prNumber: row.pr.number,
+          },
+        },
+      });
+    }
+  }
+
+  archiveFromToast(req, cx) {
+    if (!req?.worktree) return;
+    cx.spawn(async cx => {
+      const st = await worktreeStatus(exec, req.worktree).catch(() => null);
+      const reason = archiveBlockReason(st);
+      if (reason) {
+        notify({ title: `Cannot archive ${req.branch || "branch"}`, body: reason, level: "warning", timeout: 4500 });
+        return;
+      }
+      const live = terminals() ?? [];
+      const liveInWt = live.filter(t => (!t.state || t.state === "live") && (isWithin(t.cwd, req.worktree) || readLabels(t.labels)?.worktree === req.worktree));
+      if (liveInWt.length > 0) {
+        await wf(["stop", "--worktree", req.worktree]);
+      }
+      const archived = new Set(Array.isArray(shared("wf.archived")) ? shared("wf.archived") : []);
+      archived.add(req.worktree);
+      setShared("wf.archived", [...archived]);
+      track("ui", { surface: "wf-sidebar", action: "archive-merged-toast", repo: req.repo, branch: req.branch });
+      flushTelemetry();
+      notify({ title: "Branch archived", body: req.branch || req.repo || "", level: "success", timeout: 2200 });
+      cx.notify();
+    });
+  }
+
   rewatch(cx) {
-    this.cancelWatches();
-    const gen = this.watchGen;
     const targets = [];
+    const seen = new Set();
     for (const r of this.visibleRepos()) {
       if (!this.openRepos.has(r.dir)) continue;
-      targets.push({ repoDir: r.dir, dir: `${r.dir}/.bare/refs` });
-      targets.push({ repoDir: r.dir, dir: `${r.dir}/.bare/worktrees` });
-      targets.push({ repoDir: r.dir, dir: `${r.dir}/.git/refs` });
+      for (const dir of [`${r.dir}/.bare/refs`, `${r.dir}/.bare/worktrees`, `${r.dir}/.git/refs`]) {
+        if (!seen.has(dir)) { seen.add(dir); targets.push({ repoDir: r.dir, dir }); }
+      }
       const m = this.models[r.dir];
       for (const row of m?.rows ?? []) {
         if (this.openBranches.has(row.path) || row.terminals.length) {
-          targets.push({ repoDir: r.dir, dir: `${row.path}/docs` });
+          const dir = `${row.path}/docs`;
+          if (!seen.has(dir)) { seen.add(dir); targets.push({ repoDir: r.dir, dir }); }
         }
       }
     }
-    for (const { repoDir, dir } of targets.slice(0, MAX_WATCHES)) {
+    const capped = targets.slice(0, MAX_WATCHES);
+    const nextKey = capped.map(t => t.dir).sort().join("\n");
+    if (nextKey === this.watchedKey) return;
+
+    this.cancelWatches();
+    this.watchedKey = nextKey;
+    const gen = this.watchGen;
+
+    for (const { repoDir, dir } of capped) {
       cx.spawn(async cx => {
         if (!(await fs.exists(dir))) return;
+        if (this.watchGen !== gen) return;
         try {
           for (;;) {
+            if (this.watchGen !== gen) return;
             const w = watchFolder(dir);
             this.watches.push(w);
             const changed = await w;
+            const idx = this.watches.indexOf(w);
+            if (idx >= 0) this.watches.splice(idx, 1);
             if (this.watchGen !== gen || !changed?.length) return;
             const wait = MIN_GAP_MS - (Date.now() - (this.lastRefresh[repoDir] ?? 0));
             if (wait > 0) cx.timer.after(wait, cx => this.refreshRepo(repoDir, cx));
@@ -557,12 +634,23 @@ export default class WorkflowSidebar extends View {
     }
     this.saveOpen();
     track("ui", { surface: "wf-sidebar", action: wasOpen ? "collapse-branch" : "expand-branch", repo: model.name, branch: row.branch, phase: row.phase.key });
-    const space = spaceForWorktree(spaces(), panes(), row.path);
-    if (space) {
-      this.showActiveCanvas();
-      if (!space.active) run("space.select", { id: space.id });
+    if (!wasOpen) {
+      const space = spaceForWorktree(spaces(), panes(), row.path);
+      if (space) {
+        const tabs = space.tabs ?? [];
+        const isReview = tb => tb && (tb.name === "✦ Explain" || tb.name.startsWith("Δ "));
+        const activeTab = tabs.find(tb => tb.active);
+        const preferred = tabs.find(tb => !isReview(tb));
+        // Never unexpectedly jump into Explain/Diff (which auto-collapses the sidebar) while
+        // expanding a branch in the tree; default to its AI session or leftmost non-review tab.
+        if (preferred) {
+          this.showActiveCanvas();
+          if (!space.active) run("space.select", { id: space.id });
+          if (isReview(activeTab)) run("tab.select", { id: preferred.id });
+        }
+      }
+      if (space && row.terminals.length) wf(["resume", "--worktree", row.path]);
     }
-    if (space && row.terminals.length) wf(["resume", "--worktree", row.path]);
     if (cx) cx.notify();
   }
 
@@ -601,13 +689,44 @@ export default class WorkflowSidebar extends View {
     openOverlay({ mod: "wf-menu", kind: "popup", props: { mode: "session", ...propsObj } });
   }
 
-  // Opens or focuses the dedicated TeamCity Sakura CI tab in its own clean space.
-  // When closed, wf-tabs deletes that space automatically and returns to the empty canvas.
-  openCiTab(repo, slug, { workflow = null, runId = null, tab = "overview" } = {}, cx = null) {
+  // Opens or focuses a CI tab. When opened for a specific branch worktree that already has a
+  // space, opens the CI tab INSIDE that branch's space so you can tab-switch between the AI
+  // terminal, Explain, and CI. Falls back to a dedicated repo CI space for repo-level strips.
+  openCiTab(repo, slug, { workflow = null, runId = null, branch = null, worktree = null, tab = "overview" } = {}, cx = null) {
     if (!slug) return;
-    const title = `CI · ${repo.name}`;
-    setShared("wf.ciFocus", { repo: repo.name, dir: repo.dir, slug, workflow, runId, tab, ts: Date.now() });
-    for (const s of spaces() ?? []) {
+    const allSpaces = spaces() ?? [];
+    const branchSpace = worktree ? spaceForWorktree(allSpaces, panes() ?? [], worktree) : null;
+    const title = branchSpace ? "CI" : `CI · ${repo.name}`;
+    setShared("wf.ciFocus", { repo: repo.name, dir: repo.dir, slug, workflow, runId, branch, tab, ts: Date.now() });
+
+    if (branchSpace) {
+      const hit = (branchSpace.tabs ?? []).find(tb => tb.name === "CI" || tb.name === `CI · ${repo.name}`);
+      if (hit) {
+        this.showActiveCanvas();
+        if (!branchSpace.active) run("space.select", { id: branchSpace.id });
+        run("tab.select", { id: hit.id });
+        return;
+      }
+      const lockKey = `${branchSpace.id}:CI`;
+      if (this.starting.has(lockKey)) return;
+      this.starting.add(lockKey);
+      const propsObj = { repo: repo.name, dir: repo.dir, slug, workflow, runId, branch, tab };
+      const spawnFn = cx?.spawn ? (fn => cx.spawn(fn)) : (fn => fn());
+      spawnFn(async () => {
+        try {
+          await exec("herdr-app", ["do", "tab.new", JSON.stringify({ space: branchSpace.id, name: "CI", mod: "wf-ci", props: propsObj, focus: true })]);
+          this.showActiveCanvas();
+          if (!branchSpace.active) run("space.select", { id: branchSpace.id });
+        } catch (e) {
+          notify({ title: "Could not open CI tab", body: String(e?.message ?? e), level: "error" });
+        } finally {
+          this.starting.delete(lockKey);
+        }
+      });
+      return;
+    }
+
+    for (const s of allSpaces) {
       const hit = (s.tabs ?? []).find(tb => tb.name === title);
       if (hit) {
         this.showActiveCanvas();
@@ -618,11 +737,11 @@ export default class WorkflowSidebar extends View {
     }
     if (this.starting.has(title)) return;
     this.starting.add(title);
-    const propsObj = { repo: repo.name, dir: repo.dir, slug, workflow, runId, tab };
+    const propsObj = { repo: repo.name, dir: repo.dir, slug, workflow, runId, branch, tab };
     const spawnFn = cx?.spawn ? (fn => cx.spawn(fn)) : (fn => fn());
     spawnFn(async () => {
       try {
-        const res = await exec("herdr-app", ["do", "space.new", JSON.stringify({ name: title, tab: "__ci_boot__", folder: repo.dir, focus: false })]);
+        const res = await exec("herdr-app", ["do", "space.new", JSON.stringify({ name: title, tab: "__ci_boot__", folder: worktree || repo.dir, focus: false })]);
         const created = res.code === 0 ? JSON.parse(res.stdout || "{}") : null;
         if (!created?.space) {
           notify({ title: "Could not open CI tab", body: (res.stderr || res.stdout || "space.new failed").trim(), level: "error" });
@@ -643,6 +762,69 @@ export default class WorkflowSidebar extends View {
         notify({ title: "Could not open CI tab", body: String(e?.message ?? e), level: "error" });
       } finally {
         this.starting.delete(title);
+      }
+    });
+  }
+
+  // Opens or focuses the branch's AI Explain tab inside that branch's own space.
+  openExplainTab(repo, row, cx, { autoRun = false } = {}) {
+    if (!row?.path) return;
+    const tabTitle = "✦ Explain";
+    setShared("wf.branch", { repo: repo.name, repoDir: repo.dir, branch: row.branch, path: row.path });
+    setShared("wf.explainFocus", {
+      root: row.path,
+      branch: row.branch || null,
+      baseRef: null,
+      baseSha: null,
+      autoRun,
+      ts: Date.now(),
+    });
+    const allSpaces = spaces() ?? [];
+    const branchSpace = spaceForWorktree(allSpaces, panes() ?? [], row.path);
+    if (branchSpace) {
+      const hit = (branchSpace.tabs ?? []).find(tb => tb.name === tabTitle);
+      if (hit) {
+        this.showActiveCanvas();
+        if (!branchSpace.active) run("space.select", { id: branchSpace.id });
+        run("tab.select", { id: hit.id });
+        return;
+      }
+      const lockKey = `${branchSpace.id}:Explain`;
+      if (this.starting.has(lockKey)) return;
+      this.starting.add(lockKey);
+      cx.spawn(async () => {
+        try {
+          await exec("herdr-app", ["do", "tab.new", JSON.stringify({ space: branchSpace.id, name: tabTitle, mod: "wf-explain", focus: true })]);
+          this.showActiveCanvas();
+          if (!branchSpace.active) run("space.select", { id: branchSpace.id });
+        } catch (e) {
+          notify({ title: "Could not open AI Explain", body: String(e?.message ?? e), level: "error" });
+        } finally {
+          this.starting.delete(lockKey);
+        }
+      });
+      return;
+    }
+    const lockKey = `${row.path}:Explain`;
+    if (this.starting.has(lockKey)) return;
+    this.starting.add(lockKey);
+    cx.spawn(async () => {
+      try {
+        const spRes = await exec("herdr-app", ["do", "space.new", JSON.stringify({ name: tabTitle, tab: "__wf_boot__", folder: row.path, focus: false })]);
+        const sp = spRes.code === 0 ? JSON.parse(spRes.stdout || "{}") : null;
+        if (!sp?.space) throw new Error((spRes.stderr || spRes.stdout || "space.new failed").trim());
+        await exec("herdr-app", ["do", "tab.new", JSON.stringify({ space: sp.space, name: tabTitle, mod: "wf-explain", focus: true })]);
+        if (sp.tab) await exec("herdr-app", ["do", "tab.close", JSON.stringify({ id: sp.tab, confirmed: true })]);
+        if (sp.terminal) {
+          await exec("hc", ["kill", sp.terminal]).catch(() => {});
+          await exec("hc", ["rm", sp.terminal]).catch(() => {});
+        }
+        this.showActiveCanvas();
+        run("space.select", { id: sp.space });
+      } catch (e) {
+        notify({ title: "Could not open AI Explain", body: String(e?.message ?? e), level: "error" });
+      } finally {
+        this.starting.delete(lockKey);
       }
     });
   }
@@ -814,7 +996,10 @@ export default class WorkflowSidebar extends View {
     if (cur?.loading) return;
     this.branchSessions[path] = { ...(cur ?? { list: null, error: null, more: false }), loading: true };
     cx.spawn(async cx => {
-      const r = await wf(["sessions", "--worktree", path]);
+      const [r, exRes] = await Promise.all([
+        wf(["sessions", "--worktree", path]),
+        wf(["explain", "--worktree", path, "--status"]).catch(() => null),
+      ]);
       if (r.error) {
         track("error", { mod: "wf-sidebar", error: r.error });
         this.branchSessions[path] = { ...(this.branchSessions[path] ?? {}), loading: false, error: r.error };
@@ -822,6 +1007,9 @@ export default class WorkflowSidebar extends View {
         const list = r.sessions ?? [];
         this.branchSessions[path] = { ...(this.branchSessions[path] ?? {}), loading: false, list, error: null };
         this.syncTabTitlesForWorktree(path, list);
+      }
+      if (exRes?.ok) {
+        this.branchExplain[path] = { cached: Boolean(exRes.cached), staleCount: Number(exRes.staleCount || 0) };
       }
       cx.notify();
     });
@@ -1297,23 +1485,43 @@ export default class WorkflowSidebar extends View {
         .when(Boolean(pr?.number), el => {
           const prCol = pr.state === "MERGED" ? t.ansi5 : pr.state === "CLOSED" ? t.ansi1 : pr.isDraft ? t.dim : t.ansi2;
           const approved = Boolean(ci?.approved && pr.state === "OPEN" && !pr.isDraft);
-          const blocker = ci?.conflict ? { icon: "swords", color: t.ansi1 }
-            : ci?.ci === "failing" ? { icon: "workflow", color: t.ansi1 }
-            : ci?.changesRequested ? { icon: "pencil-line", color: t.ansi3 }
+          const blocker = ci?.conflict ? { icon: "swords", color: t.ansi1, isCi: false }
+            : ci?.ci === "failing" ? { icon: "workflow", color: t.ansi1, isCi: true }
+            : ci?.changesRequested ? { icon: "pencil-line", color: t.ansi3, isCi: false }
             : null;
           const progress = ci?.ci === "running" ? { icon: "workflow", color: t.ansi3 }
             : ci?.ci === "passing" ? { icon: "workflow", color: t.ansi2 }
             : null;
-          return el.child(h_flex().id(`bprbadge-${row.path}`).flex_none().gap(3).items_center().px(2).rounded(4)
-            .when(Boolean(pr.url), e => e.cursor_pointer().hover(s => s.bg(t.raised))
-              .on_click((_e, cx) => { cx.stop_propagation(); cx.open_url(pr.url); }))
-            .tooltip(ci?.tooltip ?? `PR #${pr.number} (${pr.state?.toLowerCase() ?? "open"})`)
-            .when(approved, e => e.child(h_flex().gap(1).items_center()
-              .child(svg("mods/wf-sidebar/icons/check.svg").size(11).text_color(t.ansi2))
-              .when((ci?.approvals ?? 0) > 0, e2 => e2.child(div().text_size(9.5).text_color(t.ansi2).child(String(ci.approvals))))))
-            .child(div().text_size(10.5).text_color(prCol).when(pr.state === "CLOSED", e => e.opacity(0.65)).child(`#${pr.number}`))
-            .when(Boolean(blocker), e => e.child(svg(`mods/wf-sidebar/icons/${blocker.icon}.svg`).size(11).text_color(blocker.color)))
-            .when(Boolean(progress), e => e.child(h_flex().gap(2).items_center()
+          const openBranchCi = (e, cx) => {
+            cx.stop_propagation();
+            if (model.slug) this.openCiTab({ name: model.name, dir: model.dir }, model.slug, { branch: row.branch, worktree: row.path, tab: "overview" }, cx);
+            else if (pr.url) cx.open_url(pr.url);
+          };
+          const stopDown = (_e, cx) => cx.stop_propagation();
+          return el.child(h_flex().id(`bprbadge-${row.path}`).flex_none().gap(2).items_center()
+            .child(h_flex().id(`bprnum-${row.path}`).gap(2).items_center().px(2).rounded(4)
+              .on_mouse_down("left", stopDown)
+              .when(Boolean(pr.url), e => e.cursor_pointer().hover(s => s.bg(t.raised))
+                .on_click((_e, cx) => { cx.stop_propagation(); cx.open_url(pr.url); }))
+              .tooltip(`Open PR #${pr.number} on GitHub (${pr.state?.toLowerCase() ?? "open"})`)
+              .when(approved, e => e.child(h_flex().gap(1).items_center()
+                .child(svg("mods/wf-sidebar/icons/check.svg").size(11).text_color(t.ansi2))
+                .when((ci?.approvals ?? 0) > 0, e2 => e2.child(div().text_size(9.5).text_color(t.ansi2).child(String(ci.approvals))))))
+              .child(div().text_size(10.5).text_color(prCol).when(pr.state === "CLOSED", e => e.opacity(0.65)).child(`#${pr.number}`)))
+            .when(Boolean(blocker), e => e.child(div().id(`bprblk-${row.path}`).px(2).h(16).rounded(4).flex().items_center().cursor_pointer()
+              .hover(s => s.bg(t.raised))
+              .on_mouse_down("left", stopDown)
+              .tooltip(blocker.isCi ? `${ci?.tooltip ?? "CI failing"}\nClick to open CI in Herdr` : (ci?.tooltip ?? `PR #${pr.number}`))
+              .on_click((ev, cx) => {
+                if (blocker.isCi) openBranchCi(ev, cx);
+                else { cx.stop_propagation(); if (pr.url) cx.open_url(pr.url); }
+              })
+              .child(svg(`mods/wf-sidebar/icons/${blocker.icon}.svg`).size(11).text_color(blocker.color))))
+            .when(Boolean(progress), e => e.child(h_flex().id(`bprci-${row.path}`).gap(2).px(2).h(16).rounded(4).items_center().cursor_pointer()
+              .hover(s => s.bg(t.raised))
+              .on_mouse_down("left", stopDown)
+              .tooltip(`${ci?.tooltip ?? "CI status"}\nClick to open CI in Herdr`)
+              .on_click(openBranchCi)
               .child(svg(`mods/wf-sidebar/icons/${progress.icon}.svg`).size(11).text_color(progress.color))
               .when(ci?.ci === "running" && ci.total > 0, e2 => e2.child(div().text_size(9.5).text_color(t.ansi3).child(`${ci.passed}/${ci.total}`))))));
         })
@@ -1323,6 +1531,7 @@ export default class WorkflowSidebar extends View {
         .when(hovered || isActive, el => el.child(div().id(`bplus-${row.path}`).flex_none().size(18).rounded(4).flex().items_center().justify_center()
           .text_color(t.muted).hover(s => s.bg(t.raised).text_color(t.foreground))
           .tooltip("New agent or terminal in this branch")
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_click((_e, cx) => { cx.stop_propagation(); this.openNewMenu(row.path, model.name, row.branch); })
           .child(svg("mods/workspace-chrome/plus.svg").size(11)))));
     }
@@ -1355,18 +1564,57 @@ export default class WorkflowSidebar extends View {
       out.push(div().pl(34).py(1).text_size(10.5).text_color(t.dim).child(bs?.loading ? "reading sessions..." : "no sessions yet (click + to start)"));
     }
 
-    // Compact action strip when branch is expanded (keeps branches clean; PR CI lives in the row badges)
+    // Level 3: Open non-terminal tabs in this branch's space (AI Explain / CI)
+    const branchSpace = spaceForWorktree(allSpaces, allPanes, row.path);
+    const branchTabs = branchSpace?.tabs ?? [];
+    const explainTab = branchTabs.find(tb => tb.name === "✦ Explain");
+    const ciTab = branchTabs.find(tb => tb.name === "CI" || tb.name === `CI · ${model.name}`);
+    const explainActive = Boolean(branchSpace?.active && explainTab?.active);
+    const ciActive = Boolean(branchSpace?.active && ciTab?.active);
+    const exState = this.branchExplain[row.path];
+    const prCi = row.pr?.state === "OPEN" ? prCiSummary(row.pr) : null;
+    const ciDotCol = prCi?.ci === "failing" ? t.ansi1 : prCi?.ci === "running" ? t.ansi3 : prCi?.ci === "passing" ? t.ansi2 : null;
+
+    if (explainTab) {
+      const stale = exState?.staleCount || 0;
+      out.push(h_flex().id(`bex-${row.path}`).h(23).flex_none().pl(32).pr(8).gap(6).items_center().rounded(5).cursor_pointer()
+        .when(explainActive, el => el.bg(t.selected))
+        .hover(s => s.bg(explainActive ? t.selected : t.hover))
+        .tooltip(stale > 0 ? `Focus AI Explain tab (${stale} files changed)` : "Focus AI Explain tab")
+        .on_click((_e, cx) => {
+          cx.stop_propagation();
+          this.showActiveCanvas();
+          if (!branchSpace.active) run("space.select", { id: branchSpace.id });
+          run("tab.select", { id: explainTab.id });
+        })
+        .child(svg("mods/workspace-chrome/git-compare.svg").size(12).flex_none().text_color(stale > 0 ? t.blocked : t.accent))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.4).text_color(explainActive ? t.foreground : t.muted).child("AI Explain"))
+        .when(stale > 0, el => el.child(div().px(4).h(14).rounded(3).bg(t.blocked + "22").text_size(9.5).text_color(t.blocked).flex().items_center().child(String(stale)))));
+    }
+
+    if (ciTab) {
+      out.push(h_flex().id(`bci-${row.path}`).h(23).flex_none().pl(32).pr(8).gap(6).items_center().rounded(5).cursor_pointer()
+        .when(ciActive, el => el.bg(t.selected))
+        .hover(s => s.bg(ciActive ? t.selected : t.hover))
+        .tooltip(prCi?.tooltip ? `${prCi.tooltip}\nClick to focus CI tab` : "Focus CI tab")
+        .on_click((_e, cx) => {
+          cx.stop_propagation();
+          this.showActiveCanvas();
+          if (!branchSpace.active) run("space.select", { id: branchSpace.id });
+          run("tab.select", { id: ciTab.id });
+        })
+        .child(svg("mods/wf-sidebar/icons/workflow.svg").size(12).flex_none().text_color(ciDotCol || t.muted))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.4).text_color(ciActive ? t.foreground : t.muted).child("CI"))
+        .when(Boolean(ciDotCol), el => el.child(div().size(6).flex_none().rounded_full().bg(ciDotCol))));
+    }
+
     const hasNext = Boolean(row.phase.next?.command && row.phase.who === "user");
-    if (hasNext || row.issue || row.pr?.url) {
-      out.push(h_flex().pl(34).pr(8).py(2).gap(6).items_center().text_size(10.5)
-        .when(hasNext, el => el.child(div().id(`bnext-${row.path}`).px(6).h(18).rounded(4).bg(t.blocked + "22").text_color(t.blocked).flex().items_center().cursor_pointer()
+    if (hasNext) {
+      out.push(h_flex().pl(32).pr(8).py(2).gap(6).items_center().text_size(10.5)
+        .child(div().id(`bnext-${row.path}`).px(6).h(18).rounded(4).bg(t.blocked + "22").text_color(t.blocked).flex().items_center().cursor_pointer()
           .hover(s => s.bg(t.blocked + "38")).tooltip(`Copy: ${row.phase.next.command}`)
           .on_click((_e, cx) => this.copyText(row.phase.next.command, "Command", cx))
-          .child(row.phase.next.command)))
-        .when(Boolean(row.pr?.url), el => el.child(div().id(`bpr-${row.path}`).text_color(t.accent).cursor_pointer()
-          .on_click((_e, cx) => cx.open_url(row.pr.url)).child(`PR #${row.pr.number}`)))
-        .when(Boolean(row.issue), el => el.child(div().id(`biss-${row.path}`).text_color(t.accent).cursor_pointer()
-          .on_click((_e, cx) => cx.open_url(row.issue)).child("issue"))));
+          .child(row.phase.next.command)));
     }
 
     if (isDropTarget && drag.position === "after") out.push(dropLine());
@@ -1619,7 +1867,8 @@ export default class WorkflowSidebar extends View {
 
     const allPanes = panes() ?? [];
     const allSpaces = spaces() ?? [];
-    const focusedTerm = focused()?.terminal ?? null;
+    const emptyOn = Boolean(shared("wf.emptyView")?.on);
+    const focusedTerm = emptyOn ? null : (focused()?.terminal ?? null);
     const activeWorktree = this.syncActiveFromFocus(live) ?? shared("wf.branch")?.path ?? null;
 
     // Trigger lazy session load for workspace root, expanded repos' general containers, and expanded branches.
@@ -1685,6 +1934,32 @@ export default class WorkflowSidebar extends View {
       this.lastCiBumpTs = ciBump.ts;
       cx.timer.after(1, cx => this.refreshOpenPrs(cx));
     }
+    const openCiReq = shared("wf.openCiReq");
+    if (openCiReq?.ts && openCiReq.ts > (this.lastOpenCiReqTs ?? 0) && openCiReq.slug) {
+      this.lastOpenCiReqTs = openCiReq.ts;
+      const hitRepo = this.visibleRepos().find(r => this.models[r.dir]?.slug === openCiReq.slug)
+        || (openCiReq.dir ? { name: openCiReq.repo || openCiReq.slug.split("/").pop(), dir: openCiReq.dir } : null);
+      if (hitRepo) {
+        cx.timer.after(1, cx => this.openCiTab(hitRepo, openCiReq.slug, { branch: openCiReq.branch ?? null, worktree: openCiReq.dir ?? null, tab: openCiReq.tab ?? "overview" }, cx));
+      }
+    }
+    const openExplainReq = shared("wf.openExplainReq");
+    if (openExplainReq?.ts && openExplainReq.ts > (this.lastOpenExplainReqTs ?? 0) && openExplainReq.worktree) {
+      this.lastOpenExplainReqTs = openExplainReq.ts;
+      const repoObj = { name: openExplainReq.repo || "repo", dir: openExplainReq.repoDir || openExplainReq.worktree };
+      const rowObj = { path: openExplainReq.worktree, branch: openExplainReq.branch || null };
+      cx.timer.after(1, cx => this.openExplainTab(repoObj, rowObj, cx, { autoRun: Boolean(openExplainReq.autoRun) }));
+    }
+    const explainSaved = shared("wf.explainSaved");
+    if (explainSaved?.ts && explainSaved.ts > (this.lastExplainSavedTs ?? 0) && explainSaved.root) {
+      this.lastExplainSavedTs = explainSaved.ts;
+      this.branchExplain[explainSaved.root] = { cached: true, staleCount: 0 };
+    }
+    const archiveReq = shared("wf.archiveReq");
+    if (archiveReq?.ts && archiveReq.ts > this.lastArchiveReqTs && archiveReq.worktree) {
+      this.lastArchiveReqTs = archiveReq.ts;
+      cx.timer.after(1, cx => this.archiveFromToast(archiveReq, cx));
+    }
 
     const archivedSet = new Set(Array.isArray(shared("wf.archived")) ? shared("wf.archived") : []);
     const filter = this.filterText.trim().toLowerCase();
@@ -1733,6 +2008,20 @@ export default class WorkflowSidebar extends View {
       .when(this.manage, el => el.child(this.renderManagePanel(t)))
       // 3-level collapsible tree
       .child(v_flex().id("wf-sb-tree").flex_1().min_h(0).overflow_y_scrollbar().px(4).pb(10).children(treeRows)
-        .when(!this.visibleRepos().length, el => el.child(div().p(12).text_size(11.5).text_color(t.dim).child("No repositories shown. Click + or Manage above."))));
+        .when(!this.visibleRepos().length, el => el.child(div().p(12).text_size(11.5).text_color(t.dim).child("No repositories shown. Click + or Manage above."))))
+      // Bottom footer bar: 1-click access to Workflow (All terminals) settings & Herdr Settings
+      .child(h_flex().id("wf-sb-footer").h(30).flex_none().px(8).gap(4).items_center().border_t(1).border_color(t.border)
+        .child(h_flex().id("wf-sb-mod-settings").flex_1().h(22).px(7).gap(5).rounded(5).items_center().cursor_pointer()
+          .text_size(11.2).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip("Workflow & All terminals settings (copy/paste, newline key)")
+          .on_click(() => openOverlay({ mod: "wf-term-settings", kind: "dialog", width: 560, height: 420 }))
+          .child(svg("mods/workspace-chrome/terminal.svg").size(12).flex_none())
+          .child(div().truncate().child("Terminal settings")))
+        .child(h_flex().id("wf-sb-app-settings").h(22).px(7).gap(5).rounded(5).items_center().cursor_pointer()
+          .text_size(11.2).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip("Herdr Settings (Ctrl+,)")
+          .on_click(() => run("app.settings", {}))
+          .child(svg("mods/workspace-chrome/settings.svg").size(12).flex_none())
+          .child(div().child("Herdr"))));
   }
 }
